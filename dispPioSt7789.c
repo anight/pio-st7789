@@ -493,7 +493,6 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 1);
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_Y, 8);
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_X, 32 - 9);
-	pio0_hw->instr_mem[pc++] = I_WAIT(0, 0, 1, WAIT_FOR_IRQ, 4);
 	sm0EndPC = pc - 1;	//that was the last instr
 
 	//SM1 program: SPI the data out. input 16 bit words (from DMA used for CLUT lookup)
@@ -506,7 +505,6 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_X, MOV_OP_COPY, MOV_SRC_ISR);
 	lblPullNgo = pc;
 	pio0_hw->instr_mem[pc++] = I_SET(0, 0, SET_DST_Y, 15);
-	pio0_hw->instr_mem[pc++] = I_IRQ(0, 0, 0, 1, 4);					//wait here makes sure irq does not get lost
 	lblMoreBits = pc;
 	pio0_hw->instr_mem[pc++] = I_OUT(0, 4, OUT_DST_PINS, 1);
 	pio0_hw->instr_mem[pc++] = I_JMP(0, 6, JMP_Y_POSTDEC, lblMoreBits);	//1 cy delay after here no matter if we jumped
@@ -563,14 +561,10 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->ctrl |= (3 << PIO_CTRL_SM_ENABLE_LSB);  // Enable SM0, SM1 only
 #endif
 
-	//prime irq 4
-	pio0_hw->irq_force = 1 << 4;
-	pr("LCD: irq primed\n");
-	
 	//ch1 (first) RXes a word from SM0s output and writes to ch0's source reg. then triggers ch0. ch0 then DMAs a single 16 bit CLUT value to SM1's input, triggers ch1 again
 	dma_hw->ch[0].write_addr = (uintptr_t)&pio0_hw->txf[1];
 	dma_hw->ch[0].transfer_count = 1;
-	dma_hw->ch[0].al1_ctrl = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[0].al1_ctrl = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 	
 	dma_hw->ch[1].read_addr = (uintptr_t)&pio0_hw->rxf[0];
 	dma_hw->ch[1].write_addr = (uintptr_t)&dma_hw->ch[0].al3_read_addr_trig;
@@ -590,7 +584,7 @@ static void dispPrvPioProgram8bpp(void)
 		dma_hw->ch[3].transfer_count = 1;
 		dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 	}
-	#endif
+#endif
 }
 
 static void dispPrvPioProgram16bpp(void)
@@ -1055,17 +1049,6 @@ bool dispRefreshStart(void)
 	if (mContinuousRefresh)
 		return true;  // Already running continuously
 	
-	// CRITICAL: Re-enable state machines before starting transfer
-	// They were disabled in dispRefreshWaitFinish() to stop garbage output
-	if (mCurDepth < 16) {
-		// 8bpp and lower: Enable SM0 and SM1
-		pio0_hw->ctrl |= (3 << PIO_CTRL_SM_ENABLE_LSB);
-	}
-	else {
-		// 16bpp: Enable SM0 only
-		pio0_hw->ctrl |= (1 << PIO_CTRL_SM_ENABLE_LSB);
-	}
-	
 	// Trigger one-shot transfer based on current depth
 	// We need to reset transfer counts and trigger the control channel by writing to ctrl_trig
 	if (mCurDepth < 8) {
@@ -1102,34 +1085,8 @@ bool dispRefreshWaitFinish(void)
 	if (mContinuousRefresh)
 		return true;
 	
-	// For 8bpp and lower depths, we have a multi-channel pipeline:
-	// Ch2 feeds framebuffer → SM0 → Ch1/Ch0 do CLUT lookup → SM1 shifts out
-	// The CRITICAL issue: State machines LOOP FOREVER and keep outputting garbage!
-	// We must DISABLE them after the frame completes to stop output to the display.
-	
-	if (mCurDepth < 16) {
-		// Wait for ch2 (framebuffer feeder) - the main data source
-		while (dma_channel_is_busy(2));
-		
-		// CRITICAL: Wait for SM1 TX FIFO to be empty (all data shifted to display)
-		// SM1 does the final SPI shifting, so when its TX FIFO is empty, we're truly done
-		// FSTAT bit (24 + SM_idx) indicates TX FIFO empty for that SM
-		while (!(pio0_hw->fstat & (1 << (PIO_FSTAT_TXEMPTY_LSB + 1))));
-		
-		// CRITICAL FIX: DISABLE state machines to stop them from looping and outputting garbage
-		// PIO programs have wrap points and loop forever - they won't stop on their own!
-		pio0_hw->ctrl &=~ (3 << PIO_CTRL_SM_ENABLE_LSB);  // Disable SM0 and SM1
-	}
-	else {
-		// 16bpp mode: Wait for ch0 and SM0 TX FIFO to empty
-		while (dma_hw->ch[0].al1_ctrl & DMA_CH0_CTRL_TRIG_BUSY_BITS);
-		
-		// Wait for SM0 TX FIFO to be empty (SM0 does SPI in 16bpp mode)
-		while (!(pio0_hw->fstat & (1 << (PIO_FSTAT_TXEMPTY_LSB + 0))));
-		
-		// CRITICAL FIX: DISABLE state machine to stop it from looping
-		pio0_hw->ctrl &=~ (1 << PIO_CTRL_SM_ENABLE_LSB);  // Disable SM0
-	}
+	while (dma_hw->ch[2].read_addr != (uintptr_t)mFb + mFramebufBytes);
+	while (dma_channel_is_busy(2));
 	
 	return true;
 }
