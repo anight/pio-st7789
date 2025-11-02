@@ -484,7 +484,6 @@ static void dispPrvPioProgram8bpp(void)
 #ifndef NO_TOUCH
 	uint_fast8_t sm2StartPC, sm2EndPC;
 #endif
-	uint8_t chain_target;
 	
 	//SM0 expand and request palette entry. basically input byte ??, output CLUT_BASE + (?? * 2), where CLUT_BASE is preset in register X
 	//expects X to be clut addr >> 9. input shift shifts right, output shifts right. autopush at 32, autopull at 32
@@ -582,15 +581,16 @@ static void dispPrvPioProgram8bpp(void)
 	//set up dma to send data to SM0. ch 2 to do it, ch3 to restart it (in continuous mode)
 	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[0];
 	dma_hw->ch[2].transfer_count = mFramebufBytes / sizeof(uint32_t);
-	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
-	
-	dma_hw->ch[3].read_addr = (uintptr_t)&mFb;
-	dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
-	dma_hw->ch[3].transfer_count = 1;
-	// Chain to self (3) for continuous mode, or no chain (0xF) for one-shot mode
-	chain_target = mContinuousRefresh ? 3 : 0xF;
-	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (chain_target << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
-#endif
+        uint8_t chain_target = mContinuousRefresh ? 3 : 2;
+	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (chain_target << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	if (mContinuousRefresh) {
+		dma_hw->ch[3].read_addr = (uintptr_t)&mFb;
+		dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
+		dma_hw->ch[3].transfer_count = 1;
+		dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
+	}
+	#endif
 }
 
 static void dispPrvPioProgram16bpp(void)
@@ -1079,10 +1079,7 @@ bool dispRefreshStart(void)
 	else if (mCurDepth == 8) {
 		// 8bpp mode: reset ch2 transfer count and trigger ch3
 		dma_hw->ch[2].transfer_count = mFramebufBytes / sizeof(uint32_t);
-		dma_hw->ch[3].read_addr = (uintptr_t)&mFb;
-		dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
-		dma_hw->ch[3].transfer_count = 1;
-		dma_hw->ch[3].ctrl_trig = dma_hw->ch[3].ctrl_trig | DMA_CH0_CTRL_TRIG_EN_BITS;
+                dma_hw->ch[2].al3_read_addr_trig = (uintptr_t)mFb;
 	}
 	else if (mCurDepth == 16) {
 		// 16bpp mode: reset ch0 transfer count and trigger ch1
@@ -1112,7 +1109,7 @@ bool dispRefreshWaitFinish(void)
 	
 	if (mCurDepth < 16) {
 		// Wait for ch2 (framebuffer feeder) - the main data source
-		while (dma_hw->ch[2].al1_ctrl & DMA_CH0_CTRL_TRIG_BUSY_BITS);
+		while (dma_channel_is_busy(2));
 		
 		// CRITICAL: Wait for SM1 TX FIFO to be empty (all data shifted to display)
 		// SM1 does the final SPI shifting, so when its TX FIFO is empty, we're truly done
