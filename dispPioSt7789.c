@@ -356,6 +356,7 @@ static void dispPrvPioSm2touchDmaConfigure(void)
 }
 #endif // NO_TOUCH
 
+#ifdef MODE_421BPP
 static void dispPrvPioProgram421bpp(uint_fast8_t bpp)
 {
 	uint_fast8_t pc = 0, lblAgain, lblMore, lblPullNgo, lblMoreBits, sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC;
@@ -476,9 +477,20 @@ static void dispPrvPioProgram421bpp(uint_fast8_t bpp)
 	chain_target = mContinuousRefresh ? 3 : 0xF;
 	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (chain_target << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 }
+#endif
 
+#ifdef MODE_8BPP
 static void dispPrvPioProgram8bpp(void)
 {
+	/*  For one-shot mode:
+	    cpu: send fb address to ch2 read address reg
+	    ch2: send fb byte by byte to sm0
+	    sm0: convert each 8bpp into 16bpp address using clut table and send to ch1
+	    ch1: read 16bpp address and send it to ch0
+	    ch0: read 16bpp data and send it to sm1
+	    sm1: spi 16bpp pixel
+	*/
+
 #if MAX_SUPPORTED_BPP >= 8
 	uint_fast8_t pc = 0, lblMore, lblPullNgo, lblMoreBits, sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC;
 #ifndef NO_TOUCH
@@ -490,6 +502,7 @@ static void dispPrvPioProgram8bpp(void)
 	//waits for IRQ for pushback from second SM
 	sm0StartPC = pc;
 	pio0_hw->instr_mem[pc++] = I_OUT(0, 0, OUT_DST_Y, 8);
+	pio0_hw->instr_mem[pc++] = I_OUT(0, 0, OUT_DST_NULL, 24);
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 1);
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_Y, 8);
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_X, 32 - 9);
@@ -571,12 +584,9 @@ static void dispPrvPioProgram8bpp(void)
 	dma_hw->ch[1].transfer_count = 1;
 	dma_hw->ch[1].ctrl_trig = (DREQ_PIO0_RX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
 	
-	
 	//set up dma to send data to SM0. ch 2 to do it, ch3 to restart it (in continuous mode)
 	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[0];
-	dma_hw->ch[2].transfer_count = mFramebufBytes / sizeof(uint32_t);
-        uint8_t chain_target = mContinuousRefresh ? 3 : 2;
-	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (chain_target << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (2 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	if (mContinuousRefresh) {
 		dma_hw->ch[3].read_addr = (uintptr_t)&mFb;
@@ -586,7 +596,9 @@ static void dispPrvPioProgram8bpp(void)
 	}
 #endif
 }
+#endif
 
+#ifdef MODE_16BPP
 static void dispPrvPioProgram16bpp(void)
 {
 #if MAX_SUPPORTED_BPP >= 8
@@ -671,6 +683,7 @@ static void dispPrvPioProgram16bpp(void)
 	dma_hw->ch[1].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (chain_target << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 #endif
 }
+#endif
 
 static void dipPrvPinsSetup(bool forPio)		//uses SM0. only safe while SM0 is stopped
 {
@@ -713,8 +726,6 @@ static void dispPrvPioSetup(uint_fast8_t bpp)
 	//reset SMs
 	pio0_hw->ctrl = (7 << PIO_CTRL_SM_RESTART_LSB);
 	
-	mFramebufBytes = DISP_WIDTH * DISP_HEIGHT * bpp / 8;
-	
 	dipPrvPinsSetup(true);
 	
 	if (bpp < 8)
@@ -733,14 +744,14 @@ static bool dispPrvLcdInit(uint_fast8_t depth)
 {
 	//high bit means command
 	static const uint16_t mInitSeq[] = {
-		0x8011,
-		0x803a, 0x0055,
-		0x8036, 0x00a0,
-		0x802a, 0x0000, 0x0000, LCD_REAL_WIDTH >> 8, LCD_REAL_WIDTH & 0xff,
-		0x802b, 0x0000, 0x0000, LCD_REAL_HEIGHT >> 8, LCD_REAL_HEIGHT & 0xff,
-		0x8020,
-		0x8013,
-		0x8029,
+		0x8011,          // Sleep out
+		0x803a, 0x0055,  // Interface Pixel Format
+		0x8036, 0x00a0,  // Memory Data Access Control
+//		0x802a, 0x0000, 0x0000, DISPLAY_WIDTH >> 8, DISPLAY_WIDTH & 0xff,    // Column Address Set
+//		0x802b, 0x0000, 0x0000, DISPLAY_HEIGHT >> 8, DISPLAY_HEIGHT & 0xff,  // Row Address Set
+		0x8020,          // Display Inversion Off
+		0x8013,          // Normal Display Mode On
+		0x8029,          // Display On
 	};
 	uint_fast8_t i;
 	
@@ -750,7 +761,8 @@ static bool dispPrvLcdInit(uint_fast8_t depth)
 	sleep_ms(50);
 	sio_hw->gpio_set = 1 << PIN_LCD_RESET;
 	pr("display out of reset\n");
-	
+	sleep_ms(50);
+
 	sio_hw->gpio_clr = 1 << PIN_LCD_CS;
 	sio_hw->gpio_clr = 1 << PIN_LCD_DnC;
 	spiByte(0x04);
@@ -774,7 +786,7 @@ static bool dispPrvLcdInit(uint_fast8_t depth)
 		//return false;
 	}
 	sio_hw->gpio_set = 1 << PIN_LCD_CS;
-	
+
 	for (i = 0; i < sizeof(mInitSeq) / sizeof(*mInitSeq); i++) {
 		if (mInitSeq[i] >> 15)
 			lcdPrvWriteCmd(mInitSeq[i]);
@@ -785,7 +797,7 @@ static bool dispPrvLcdInit(uint_fast8_t depth)
 	return true;
 }
 
-static void dispPrvLcdSetDrawArea(uint_fast16_t topLeftRow, uint_fast16_t topLeftCol, uint_fast16_t width, uint_fast16_t height)	//and issue write command
+static void dispPrvLcdSetDrawArea(uint_fast16_t topLeftCol, uint_fast16_t topLeftRow, uint_fast16_t width, uint_fast16_t height)	//and issue write command
 {
 	uint_fast16_t endCol = topLeftCol + width - 1, endRow = topLeftRow + height - 1;
 	
@@ -917,38 +929,21 @@ static bool dispPrvTurnOff(void)
 	return true;
 }
 
-static bool dispPrvTurnOn(uint_fast8_t depth, bool firstTime)
+static bool dispPrvTurnOn(uint_fast8_t depth)
 {
-	uint32_t i;
-	
-	if (mDispOn && depth == mCurDepth)
-		return true;
-		
-	else if (mDispOn) {
-		
-		pr("depth change with no off\n");
-		return false;
-	}
-	
 	pr("DISP: depth %u\n", depth);
 	
 	if (!dispPrvLcdInit(depth)) {
-		
 		pr("DISP INIT FAIL\n");
 		return false;
 	}
-	
-	if (firstTime) {
-	
-		//fill the whole screen with blackness (no matter the current bit depth)
-//		dispPrvLcdSetDrawArea(0, 0, LCD_REAL_WIDTH, LCD_REAL_HEIGHT);
-//		for (i = 0; i < LCD_REAL_WIDTH * LCD_REAL_HEIGHT * 2; i++)
-//			lcdPrvWriteData(0);
+
+        //fill the whole screen with blackness (no matter the current bit depth)
+	dispPrvLcdSetDrawArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        for (uint32_t i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT * 2; i++) {
+                lcdPrvWriteData(0);
 	}
-	
-	//prepare to draw
-	dispPrvLcdSetDrawArea((LCD_REAL_HEIGHT - DISP_HEIGHT) / 2, (LCD_REAL_WIDTH - DISP_WIDTH) / 2, DISP_WIDTH, DISP_HEIGHT);
-	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
+
 	dispPrvPioSetup(depth);
 		
 	mDispOn = true;
@@ -976,28 +971,6 @@ void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *
 	}
 	//it is effective immediately
 #endif
-}
-
-void dispSetDepth(uint8_t depth)
-{
-	if (mCurDepth != depth) {
-		
-		if (mDispOn) {
-			dispPrvTurnOff();
-			dispPrvTurnOn(depth, false);
-		}
-		mCurDepth = depth;
-	}
-}
-
-bool dispOn(void)
-{
-	return dispPrvTurnOn(mCurDepth, false);
-}
-
-bool dispOff(void)
-{
-	return dispPrvTurnOff();
 }
 
 void dispSetContinuousRefresh(bool enabled)
@@ -1037,67 +1010,32 @@ void dispDebugPrintStatus(void)
 	printf("FSTAT: 0x%08lx\n", fstat);
 }
 
-bool dispRefreshStart(void)
+bool dispDrawBuffer(void* framebuffer, uint32_t size, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t stride)
 {
-	if (!mDispOn)
-		return false;
-	
-	// This function triggers a one-shot transfer
-	// For one-shot mode, we reconfigure and trigger the DMA
-	// For continuous mode, this is a no-op since it's already running
-	
-	if (mContinuousRefresh)
-		return true;  // Already running continuously
-	
-	// Trigger one-shot transfer based on current depth
-	// We need to reset transfer counts and trigger the control channel by writing to ctrl_trig
-	if (mCurDepth < 8) {
-		// 1/2/4 bpp mode: reset ch2 transfer count and trigger ch3
-		dma_hw->ch[2].transfer_count = mFramebufBytes / sizeof(uint32_t);
-		dma_hw->ch[3].read_addr = (uintptr_t)&mFb;
-		dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
-		dma_hw->ch[3].transfer_count = 1;
-		dma_hw->ch[3].ctrl_trig = dma_hw->ch[3].ctrl_trig | DMA_CH0_CTRL_TRIG_EN_BITS;
-	}
-	else if (mCurDepth == 8) {
-		// 8bpp mode: reset ch2 transfer count and trigger ch3
-		dma_hw->ch[2].transfer_count = mFramebufBytes / sizeof(uint32_t);
-                dma_hw->ch[2].al3_read_addr_trig = (uintptr_t)mFb;
-	}
-	else if (mCurDepth == 16) {
-		// 16bpp mode: reset ch0 transfer count and trigger ch1
-		dma_hw->ch[0].transfer_count = mFramebufBytes / sizeof(uint16_t);
-		dma_hw->ch[1].read_addr = (uintptr_t)&mFb;
-		dma_hw->ch[1].write_addr = (uintptr_t)&dma_hw->ch[0].al3_read_addr_trig;
-		dma_hw->ch[1].transfer_count = 1;
-		dma_hw->ch[1].ctrl_trig = dma_hw->ch[1].ctrl_trig | DMA_CH0_CTRL_TRIG_EN_BITS;
-	}
-	
+	mFb = framebuffer;
+	mFramebufBytes = size;
+        dipPrvPinsSetup(false);
+	dispPrvLcdSetDrawArea(x, y, width, height);
+	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
+	dipPrvPinsSetup(true);
+
+	dma_hw->ch[2].transfer_count = mFramebufBytes;
+        dma_hw->ch[2].al3_read_addr_trig = (uintptr_t)mFb;
+
 	return true;
 }
 
-bool dispRefreshWaitFinish(void)
+bool dispDrawWaitFinish(void)
 {
-	if (!mDispOn)
-		return false;
-	
-	// In continuous mode, there's no specific "finish" to wait for
-	if (mContinuousRefresh)
-		return true;
-	
 	while (dma_hw->ch[2].read_addr != (uintptr_t)mFb + mFramebufBytes);
 	while (dma_channel_is_busy(2));
 	
 	return true;
 }
 
-bool dispInit(void* framebuffer, uint8_t bitDepth)
+bool dispInit(uint8_t bitDepth)
 {
-	uint32_t vramSz;
-	
-	pr("DISP is %u x %u\n", DISP_WIDTH, DISP_HEIGHT);
-	
-	mFb = framebuffer;
-	
-	return dispPrvTurnOn(mCurDepth = bitDepth, true);
+	pr("Init: display is %u x %u\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+	mCurDepth = bitDepth;
+	return dispPrvTurnOn(bitDepth);
 }

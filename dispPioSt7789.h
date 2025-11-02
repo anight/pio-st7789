@@ -27,12 +27,10 @@
 #include <stdint.h>
 
 
-#define MAX_SUPPORTED_BPP						16
-#define DISP_WIDTH								320		//the size of the display you want (drawn in the center of real display)
-#define DISP_HEIGHT								240
+#define MAX_SUPPORTED_BPP                                               16
 
-#define LCD_REAL_WIDTH							320		//actual size of the LCD display
-#define LCD_REAL_HEIGHT							240
+#define DISPLAY_WIDTH                                                   320		//actual size of the LCD display
+#define DISPLAY_HEIGHT                                                  240
 
 
 //externally defined
@@ -47,11 +45,8 @@ struct ClutEntry {
 
 //defined here
 
-void dispSetDepth(uint8_t depth);
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
-bool dispInit(void* framebuffer, uint8_t depth);
-bool dispOn(void);
-bool dispOff(void);
+bool dispInit(uint8_t depth);
 
 // Refresh control API
 // 
@@ -60,18 +55,18 @@ bool dispOff(void);
 // framebuffer infrequently, you can switch to one-shot mode for power savings.
 //
 // Example usage (continuous mode - default):
-//   dispInit(framebuffer, 16);
+//   dispInit(16);
 //   // Display auto-refreshes continuously
 //
 // Example usage (one-shot mode - synchronous):
-//   dispInit(framebuffer, 16);
+//   dispInit(16);
 //   dispSetContinuousRefresh(false);  // Switch to one-shot mode
 //   // Update framebuffer...
 //   dispRefreshStart();               // Start copying framebuffer to display
 //   dispRefreshWaitFinish();          // Wait for transfer to complete
 //
 // Example usage (one-shot mode - asynchronous):
-//   dispInit(framebuffer, 16);
+//   dispInit(16);
 //   dispSetContinuousRefresh(false);  // Switch to one-shot mode
 //   // Update framebuffer...
 //   dispRefreshStart();               // Start copying framebuffer to display
@@ -80,8 +75,8 @@ bool dispOff(void);
 //   dispRefreshWaitFinish();          // Wait for transfer to complete before next update
 //
 void dispSetContinuousRefresh(bool enabled);  // Enable/disable automatic continuous refresh
-bool dispRefreshStart(void);                  // Start a one-shot framebuffer copy (non-blocking)
-bool dispRefreshWaitFinish(void);             // Wait for one-shot framebuffer copy to complete
+bool dispDrawBuffer(void* framebuffer, uint32_t size, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t stride); // Draw a framebuffer to the display (non-blocking)
+bool dispDrawWaitFinish(void);             // Wait for one-shot framebuffer copy to complete
 
 // Debug function to print current status of DMA channels and state machines
 void dispDebugPrintStatus(void);
