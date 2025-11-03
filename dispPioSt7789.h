@@ -43,42 +43,21 @@ struct ClutEntry {
 	uint8_t r, g, b;	
 };
 
-//defined here
+struct Rect {
+	uint16_t x;
+	uint16_t y;
+	uint16_t width;
+	uint16_t height;
+};
+
+struct dmaTransfer;
 
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
 bool dispInit(uint8_t depth);
-
-// Refresh control API
-// 
-// By default, the display runs in continuous refresh mode where the framebuffer is
-// automatically copied to the display continuously. For applications that update the
-// framebuffer infrequently, you can switch to one-shot mode for power savings.
-//
-// Example usage (continuous mode - default):
-//   dispInit(16);
-//   // Display auto-refreshes continuously
-//
-// Example usage (one-shot mode - synchronous):
-//   dispInit(16);
-//   dispSetContinuousRefresh(false);  // Switch to one-shot mode
-//   // Update framebuffer...
-//   dispRefreshStart();               // Start copying framebuffer to display
-//   dispRefreshWaitFinish();          // Wait for transfer to complete
-//
-// Example usage (one-shot mode - asynchronous):
-//   dispInit(16);
-//   dispSetContinuousRefresh(false);  // Switch to one-shot mode
-//   // Update framebuffer...
-//   dispRefreshStart();               // Start copying framebuffer to display
-//   // Do other work while DMA transfer is in progress...
-//   doSomeWork();
-//   dispRefreshWaitFinish();          // Wait for transfer to complete before next update
-//
-void dispSetContinuousRefresh(bool enabled);  // Enable/disable automatic continuous refresh
-bool dispDrawBuffer(void* framebuffer, uint32_t size, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t stride); // Draw a framebuffer to the display (non-blocking)
-bool dispDrawWaitFinish(void);             // Wait for one-shot framebuffer copy to complete
-
-// Debug function to print current status of DMA channels and state machines
+struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t stride); // Draw a framebuffer to the display (non-blocking)
+struct dmaTransfer *dispDrawOneColor(uint16_t color);     // Fill entire screen with single color using DMA (8bpp mode)
+void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer);
+bool dispSetClipArea(uint16_t x, uint16_t y, uint16_t width, uint16_t height); // Set the clip area for drawing
 void dispDebugPrintStatus(void);
 
 #endif

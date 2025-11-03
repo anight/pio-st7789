@@ -65,9 +65,10 @@ static volatile uint16_t mTouchCoords[4];
 #endif
 static uint32_t mFramebufBytes;
 static bool mDispOn = false;
-static bool mContinuousRefresh = true;
+static bool mContinuousRefresh = false;
 static uint8_t mCurDepth;
 static void* mFb;
+static struct Rect mClipArea = {0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT};
 
 
 //these manual spi pieces are only used at start-up. We could use the SPI unit, but why bother?
@@ -938,14 +939,10 @@ static bool dispPrvTurnOn(uint_fast8_t depth)
 		return false;
 	}
 
-        //fill the whole screen with blackness (no matter the current bit depth)
-	dispPrvLcdSetDrawArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-        for (uint32_t i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT * 2; i++) {
-                lcdPrvWriteData(0);
-	}
-
 	dispPrvPioSetup(depth);
 		
+	dispDmaTransferWaitFinish(dispDrawOneColor(0x0000));
+
 	mDispOn = true;
 	return true;
 }
@@ -976,6 +973,17 @@ void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *
 void dispSetContinuousRefresh(bool enabled)
 {
 	mContinuousRefresh = enabled;
+}
+
+bool dispSetClipArea(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+	if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT || x + width > DISPLAY_WIDTH || y + height > DISPLAY_HEIGHT)
+		return false;
+	mClipArea.x = x;
+	mClipArea.y = y;
+	mClipArea.width = width;
+	mClipArea.height = height;
+	return true;
 }
 
 void dispDebugPrintStatus(void)
@@ -1010,27 +1018,140 @@ void dispDebugPrintStatus(void)
 	printf("FSTAT: 0x%08lx\n", fstat);
 }
 
-bool dispDrawBuffer(void* framebuffer, uint32_t size, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t stride)
+struct dmaTransfer {
+	bool is_working;
+	uintptr_t ch3_end_read_addr;
+	uintptr_t ch2_end_read_addr;
+};
+
+static struct dmaTransfer dmaTransfer = {
+	.is_working = false,
+};
+
+struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t stride)
 {
-	mFb = framebuffer;
-	mFramebufBytes = size;
+	if (dmaTransfer.is_working) {
+		dispDmaTransferWaitFinish(&dmaTransfer);
+	}
+
+	// Clip the draw area to mClipArea
+	int16_t clipLeft = mClipArea.x;
+	int16_t clipTop = mClipArea.y;
+	int16_t clipRight = clipLeft + mClipArea.width;
+	int16_t clipBottom = clipTop + mClipArea.height;
+	
+	int16_t drawRight = x + width;
+	int16_t drawBottom = y + height;
+	
+	// Check if rectangles overlap
+	if (x >= clipRight || y >= clipBottom || drawRight <= clipLeft || drawBottom <= clipTop)
+		return NULL;  // No overlap, nothing to draw
+
+	// Calculate clipped pixels from left and top
+	int16_t clippedLeft = (x < clipLeft) ? (clipLeft - x) : 0;
+	int16_t clippedTop = (y < clipTop) ? (clipTop - y) : 0;
+	
+	// Calculate intersection rectangle
+	int16_t newX = (x < clipLeft) ? clipLeft : x;
+	int16_t newY = (y < clipTop) ? clipTop : y;
+	int16_t newRight = (drawRight > clipRight) ? clipRight : drawRight;
+	int16_t newBottom = (drawBottom > clipBottom) ? clipBottom : drawBottom;
+	
+	uint16_t newWidth = newRight - newX;
+	uint16_t newHeight = newBottom - newY;
+	
+	// Adjust framebuffer pointer to skip clipped pixels (assuming 8bpp = 1 byte per pixel)
+	uint8_t* adjustedFb = (uint8_t*)framebuffer + (clippedTop * stride) + clippedLeft;
+	
+	// Calculate new size
+	uint32_t newSize = newHeight * newWidth;
+
+        bool sourceStrideMismatch = newWidth != stride;
+
+	// Update parameters
+	x = newX;
+	y = newY;
+	width = newWidth;
+	height = newHeight;
+	
         dipPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(x, y, width, height);
 	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
 	dipPrvPinsSetup(true);
 
-	dma_hw->ch[2].transfer_count = mFramebufBytes;
-        dma_hw->ch[2].al3_read_addr_trig = (uintptr_t)mFb;
+	static uintptr_t bufs[DISPLAY_HEIGHT + 1];
 
-	return true;
+	if (sourceStrideMismatch) {
+		uint32_t i;
+		uintptr_t addr = (uintptr_t)adjustedFb;
+		for (i = 0; i < height; i++, addr += stride) {
+			bufs[i] = addr;
+		}
+		bufs[i] = 0;
+		dma_hw->ch[2].transfer_count = width;
+		dmaTransfer.ch2_end_read_addr = 0;
+		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[height+1];
+	} else {
+		bufs[0] = (uintptr_t)adjustedFb;
+		bufs[1] = 0;
+		dma_hw->ch[2].transfer_count = newSize;
+		dmaTransfer.ch2_end_read_addr = 0;
+		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
+	}
+	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
+	dma_hw->ch[3].transfer_count = 1;
+	dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
+	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dmaTransfer.is_working = true;
+	return &dmaTransfer;
 }
 
-bool dispDrawWaitFinish(void)
+void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer)
 {
-	while (dma_hw->ch[2].read_addr != (uintptr_t)mFb + mFramebufBytes);
-	while (dma_channel_is_busy(2));
+	while (dma_hw->ch[3].read_addr != dmaTransfer->ch3_end_read_addr);
+	while (dma_channel_is_busy(3));
+	if (dmaTransfer->ch2_end_read_addr != (uintptr_t)-1) {
+	        while (dma_hw->ch[2].read_addr != dmaTransfer->ch2_end_read_addr);
+	        while (dma_channel_is_busy(2));
+	}
+	dmaTransfer->is_working = false;
+}
+
+struct dmaTransfer *dispDrawOneColor(uint16_t color)
+{
+	static volatile uint16_t mColorValue;
+	uint32_t numPixels = mClipArea.width * mClipArea.height;
+
+	if (dmaTransfer.is_working) {
+		dispDmaTransferWaitFinish(&dmaTransfer);
+	}
+
+	// Store the color value
+	mColorValue = color;
 	
-	return true;
+	// Setup drawing area for full screen
+	dipPrvPinsSetup(false);
+	dispPrvLcdSetDrawArea(mClipArea.x, mClipArea.y, mClipArea.width, mClipArea.height);
+	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
+	dipPrvPinsSetup(true);
+	
+	// Configure DMA channel 3 to send color directly to sm[1]
+	dma_hw->ch[3].read_addr = (uintptr_t)&mColorValue;
+	dma_hw->ch[3].write_addr = (uintptr_t)&pio0_hw->txf[1];
+	dma_hw->ch[3].transfer_count = numPixels;
+	dma_hw->ch[3].ctrl_trig = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | 
+	                           (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | 
+	                           (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | 
+	                           DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dmaTransfer.ch3_end_read_addr = (uintptr_t)&mColorValue;
+	dmaTransfer.ch2_end_read_addr = (uintptr_t)-1;
+	dmaTransfer.is_working = true;
+
+	return &dmaTransfer;
 }
 
 bool dispInit(uint8_t bitDepth)
