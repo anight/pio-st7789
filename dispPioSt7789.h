@@ -26,17 +26,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-
-#define MAX_SUPPORTED_BPP                                               16
-
 #define DISPLAY_WIDTH                                                   320		//actual size of the LCD display
 #define DISPLAY_HEIGHT                                                  240
-
-
-//externally defined
-#ifndef NO_TOUCH
-void dispExtTouchReport(int16_t x, int16_t y);	//negative on pen up
-#endif
 
 //structs
 struct ClutEntry {
@@ -44,20 +35,20 @@ struct ClutEntry {
 };
 
 struct Rect {
-	uint16_t x;
-	uint16_t y;
+	int16_t x;
+	int16_t y;
 	uint16_t width;
 	uint16_t height;
 };
 
 struct dmaTransfer;
 
+bool dispInit();
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
-bool dispInit(uint8_t depth);
-struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t stride); // Draw a framebuffer to the display (non-blocking)
-struct dmaTransfer *dispDrawOneColor(uint16_t color);     // Fill entire screen with single color using DMA (8bpp mode)
+bool dispSetClipArea(const struct Rect *rect);
+struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
+struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect);
 void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer);
-bool dispSetClipArea(uint16_t x, uint16_t y, uint16_t width, uint16_t height); // Set the clip area for drawing
 void dispDebugPrintStatus(void);
 
 #endif
