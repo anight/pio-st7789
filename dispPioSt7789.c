@@ -40,9 +40,6 @@
 #include "dispPioSt7789.h"
 #include "pinout.h"
 
-// Define debug print function
-#define pr printf
-
 #define SIDE_SET_HAS_ENABLE_BIT				1
 #define SIDE_SET_NUM_BITS					2
 #define DEFINE_PIO_INSTRS
@@ -142,8 +139,8 @@ static void dispPrvPioProgram8bpp(void)
 
 	sm1EndPC = pc - 1;	//that was the last instr
 
-	pr("LCD: PIO programs created. %u instrs\n", pc);
-	pr("LCD: PIO prog 0 is %u..%u, 1 is %u..%u\n", sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC);
+	printf("LCD: PIO programs created. %u instrs\n", pc);
+	printf("LCD: PIO prog 0 is %u..%u, 1 is %u..%u\n", sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC);
 	
 	//configure sm0
 	pio0_hw->sm[0].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
@@ -226,8 +223,6 @@ static void dispPrvLcdInit(void)
 		0x8011,          // Sleep out
 		0x803a, 0x0055,  // Interface Pixel Format
 		0x8036, 0x00a0,  // Memory Data Access Control
-//		0x802a, 0x0000, 0x0000, DISPLAY_WIDTH >> 8, DISPLAY_WIDTH & 0xff,    // Column Address Set
-//		0x802b, 0x0000, 0x0000, DISPLAY_HEIGHT >> 8, DISPLAY_HEIGHT & 0xff,  // Row Address Set
 		0x8020,          // Display Inversion Off
 		0x8013,          // Normal Display Mode On
 		0x8029,          // Display On
@@ -236,34 +231,11 @@ static void dispPrvLcdInit(void)
 	
 	//reset
 	sio_hw->gpio_clr = 1 << PIN_LCD_RESET;
-	pr("display in reset\n");
 	sleep_ms(50);
 	sio_hw->gpio_set = 1 << PIN_LCD_RESET;
-	pr("display out of reset\n");
 	sleep_ms(50);
 
-	sio_hw->gpio_clr = 1 << PIN_LCD_CS;
-	sio_hw->gpio_clr = 1 << PIN_LCD_DnC;
-	spiByte(0x04);
 	sio_hw->gpio_set = 1 << PIN_LCD_DnC;
-	if ((i = spiByte(0)) != 0x42) {
-		pr("LCD: %s ID byte is unexpected: %02xh!\n", "first", i);
-		//we could bail out here, but some displays do have different IDs and docs do not list all the valid values
-		//sio_hw->gpio_set = 1 << PIN_LCD_CS;
-		//return false;
-	}
-	if ((i = spiByte(0)) != 0xc2) {
-		pr("LCD: %s ID byte is unexpected: %02xh!\n", "second", i);
-		//we could bail out here, but some displays do have different IDs and docs do not list all the valid values
-		//sio_hw->gpio_set = 1 << PIN_LCD_CS;
-		//return false;
-	}
-	if ((i = spiByte(0)) != 0xa9) {
-		pr("LCD: %s ID byte is unexpected: %02xh!\n", "third", i);
-		//we could bail out here, but some displays do have different IDs and docs do not list all the valid values
-		//sio_hw->gpio_set = 1 << PIN_LCD_CS;
-		//return false;
-	}
 	sio_hw->gpio_set = 1 << PIN_LCD_CS;
 
 	for (i = 0; i < sizeof(mInitSeq) / sizeof(*mInitSeq); i++) {
@@ -298,8 +270,6 @@ static void dispPrvTurnOff(void)
 {
 	uint_fast8_t i, numDmaChannels = 6;
 	
-	pr("DISP: display off start\n");
-	
 	dma_hw->inte0 &=~ (1 << 5);
 	for (i = 0; i < numDmaChannels; i++)
 		dma_hw->ch[i].al1_ctrl &=~ DMA_CH0_CTRL_TRIG_EN_BITS;
@@ -315,8 +285,6 @@ static void dispPrvTurnOff(void)
 	dipPrvPinsSetup(false);
 	sio_hw->gpio_set = (1 << PIN_LCD_CS);
 	sio_hw->gpio_clr = (1 << PIN_SPI_CLK) | (1 << PIN_SPI_MOSI);
-	
-	pr("DISP: display off end\n");
 }
 
 static void dispPrvTurnOn(void)
@@ -537,6 +505,6 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 
 bool dispInit(void)
 {
-	pr("Init: display is %u x %u\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+	printf("Init: display is %u x %u\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
 	dispPrvTurnOn();
 }
