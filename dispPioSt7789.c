@@ -35,6 +35,7 @@
 #include "hardware/structs/sio.h"
 #include "hardware/structs/dma.h"
 #include "hardware/dma.h"
+#include "hardware/gpio.h"
 #include "hardware/irq.h"
 
 #include "dispPioSt7789.h"
@@ -188,8 +189,12 @@ static void dipPrvPinsSetup(bool forPio)		//uses SM0. only safe while SM0 is sto
 		pio0_hw->sm[0].pinctrl = (pio0_hw->sm[0].pinctrl &~ (PIO_SM1_PINCTRL_SET_BASE_BITS | PIO_SM1_PINCTRL_SET_COUNT_BITS)) | (pin << PIO_SM1_PINCTRL_SET_BASE_LSB) | (1 << PIO_SM1_PINCTRL_SET_COUNT_LSB);
 		pio0_hw->sm[0].instr = I_SET(0, 0, SET_DST_PINDIRS, 1);
 		pio0_hw->sm[0].instr = I_SET(0, 0, SET_DST_PINS, j >= 2);
-		
-		iobank0_hw->io[pin].ctrl = (iobank0_hw->io[pin].ctrl &~ IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS) | ((forPio ? IO_BANK0_GPIO0_CTRL_FUNCSEL_VALUE_PIO0_0 : IO_BANK0_GPIO0_CTRL_FUNCSEL_VALUE_SIO_0) << IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB);
+
+		/* gpio_set_function, not a raw FUNCSEL poke: on RP2350 that also
+		 * clears the pad isolation latch, and SIO's FUNCSEL constant was
+		 * renamed (SIO_0 -> SIOB_PROC_0). GPIO_FUNC_PIO0 / GPIO_FUNC_SIO
+		 * are the same numbers on both chips. */
+		gpio_set_function(pin, forPio ? GPIO_FUNC_PIO0 : GPIO_FUNC_SIO);
 	}
 }
 
