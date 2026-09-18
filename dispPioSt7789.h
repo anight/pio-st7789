@@ -76,6 +76,10 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 //if dispInit() was not given 16.
 struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
 struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect);
+//Has the transfer finished? Tests the same conditions as the wait below, once,
+//without spinning. Clears the transfer's busy flag when it has.
+bool dispDmaTransferBusy(struct dmaTransfer *dmaTransfer);
+
 void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer);
 void dispDebugPrintStatus(void);
 

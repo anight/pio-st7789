@@ -629,6 +629,37 @@ struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const str
 	return &dmaTransfer;
 }
 
+/*
+ * Has this transfer finished, without waiting for it?
+ *
+ * The same four conditions dispDmaTransferWaitFinish() spins on, tested once. A
+ * caller cycling two framebuffers uses this to find out whether the panel is
+ * still reading one of them, and can spend the time on something else instead of
+ * blocking - which is the only thing the blocking version lets it do.
+ *
+ * Clears is_working once the transfer is done, so a later wait returns at once.
+ */
+bool dispDmaTransferBusy(struct dmaTransfer *dmaTransfer)
+{
+	if (!dmaTransfer->is_working)
+		return false;
+
+	if (dma_hw->ch[3].read_addr != dmaTransfer->ch3_end_read_addr)
+		return true;
+	if (dma_channel_is_busy(3))
+		return true;
+
+	if (dmaTransfer->ch2_end_read_addr != (uintptr_t)-1) {
+		if (dma_hw->ch[2].read_addr != dmaTransfer->ch2_end_read_addr)
+			return true;
+		if (dma_channel_is_busy(2))
+			return true;
+	}
+
+	dmaTransfer->is_working = false;
+	return false;
+}
+
 void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer)
 {
 	while (dma_hw->ch[3].read_addr != dmaTransfer->ch3_end_read_addr);
