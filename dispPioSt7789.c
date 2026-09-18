@@ -39,7 +39,6 @@
 #include "hardware/irq.h"
 
 #include "dispPioSt7789.h"
-#include "pinout.h"
 
 #define SIDE_SET_HAS_ENABLE_BIT				1
 #define SIDE_SET_NUM_BITS					2
@@ -49,6 +48,10 @@
 
 static uint16_t __attribute__((aligned(512))) mClut[256];		//MUST be 512 bytes aligned
 
+/* How this panel is wired, as dispInit() was given it. A copy, so the caller
+ * may pass a stack local, and the driver's only source of pin numbers. */
+static struct dispPinout mPins;
+
 static struct Rect mClipArea = {0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT};
 
 
@@ -56,14 +59,14 @@ static struct Rect mClipArea = {0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT};
 static uint8_t spiBit(uint8_t bit)
 {
 	if (bit)
-		sio_hw->gpio_set = 1 << PIN_SPI_MOSI;
+		sio_hw->gpio_set = 1 << mPins.mosi;
 	else
-		sio_hw->gpio_clr = 1 << PIN_SPI_MOSI;
+		sio_hw->gpio_clr = 1 << mPins.mosi;
 	asm volatile("dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy");
-	sio_hw->gpio_togl = 1 << PIN_SPI_CLK;
+	sio_hw->gpio_togl = 1 << mPins.sck;
 	asm volatile("dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy");
-	bit = ((sio_hw->gpio_in >> PIN_SPI_MISO) & 1);
-	sio_hw->gpio_togl = 1 << PIN_SPI_CLK;
+	bit = ((sio_hw->gpio_in >> mPins.miso) & 1);
+	sio_hw->gpio_togl = 1 << mPins.sck;
 	asm volatile("dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy;dsb sy");
 	
 	return bit;
@@ -81,20 +84,20 @@ static uint8_t spiByte(uint8_t val)
 
 static void lcdPrvWriteByte(uint8_t val)
 {
-	sio_hw->gpio_clr = 1 << PIN_LCD_CS;
+	sio_hw->gpio_clr = 1 << mPins.cs;
 	spiByte(val);
-	sio_hw->gpio_set = 1 << PIN_LCD_CS;
+	sio_hw->gpio_set = 1 << mPins.cs;
 }
 
 static void lcdPrvWriteCmd(uint8_t val)
 {
-	sio_hw->gpio_clr = 1 << PIN_LCD_DnC;
+	sio_hw->gpio_clr = 1 << mPins.dnc;
 	lcdPrvWriteByte(val);
 }
 
 static void lcdPrvWriteData(uint8_t val)
 {
-	sio_hw->gpio_set = 1 << PIN_LCD_DnC;
+	sio_hw->gpio_set = 1 << mPins.dnc;
 	lcdPrvWriteByte(val);
 }
 
@@ -157,7 +160,7 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->sm[1].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
 	pio0_hw->sm[1].execctrl = (pio0_hw->sm[1].execctrl &~ (PIO_SM0_EXECCTRL_WRAP_TOP_BITS | PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS | PIO_SM2_EXECCTRL_SIDE_EN_BITS)) | (sm1EndPC << PIO_SM0_EXECCTRL_WRAP_TOP_LSB) | (sm1StartPC << PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB) | (SIDE_SET_HAS_ENABLE_BIT ? PIO_SM2_EXECCTRL_SIDE_EN_BITS : 0);
 	pio0_hw->sm[1].shiftctrl = (pio0_hw->sm[1].shiftctrl &~ (PIO_SM1_SHIFTCTRL_PULL_THRESH_BITS | PIO_SM1_SHIFTCTRL_PUSH_THRESH_BITS | PIO_SM0_SHIFTCTRL_IN_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_AUTOPUSH_BITS)) | PIO_SM0_SHIFTCTRL_AUTOPULL_BITS | (16 << PIO_SM1_SHIFTCTRL_PULL_THRESH_LSB);
-	pio0_hw->sm[1].pinctrl = (SIDE_SET_BITS_USED << PIO_SM1_PINCTRL_SIDESET_COUNT_LSB) | (1 << PIO_SM1_PINCTRL_OUT_COUNT_LSB) | (PIN_SPI_MISO << PIO_SM1_PINCTRL_IN_BASE_LSB) | (PIN_LCD_CS << PIO_SM1_PINCTRL_SIDESET_BASE_LSB) | (PIN_SPI_MOSI << PIO_SM1_PINCTRL_OUT_BASE_LSB);
+	pio0_hw->sm[1].pinctrl = (SIDE_SET_BITS_USED << PIO_SM1_PINCTRL_SIDESET_COUNT_LSB) | (1 << PIO_SM1_PINCTRL_OUT_COUNT_LSB) | (mPins.miso << PIO_SM1_PINCTRL_IN_BASE_LSB) | (mPins.cs << PIO_SM1_PINCTRL_SIDESET_BASE_LSB) | (mPins.mosi << PIO_SM1_PINCTRL_OUT_BASE_LSB);
 	
 	//start sm0..sm2
 	pio0_hw->sm[0].instr = I_JMP(0, 0, JMP_ALWAYS, sm0StartPC);
@@ -177,7 +180,7 @@ static void dispPrvPioProgram8bpp(void)
 
 static void dipPrvPinsSetup(bool forPio)		//uses SM0. only safe while SM0 is stopped
 {
-	const uint8_t mPinsForDir[] = {PIN_SPI_CLK, PIN_SPI_MOSI, PIN_LCD_CS}; //first in others out
+	const uint8_t mPinsForDir[] = {mPins.sck, mPins.mosi, mPins.cs}; //first in others out
 	uint_fast8_t j;
 	
 	for (j = 0; j < sizeof(mPinsForDir) / sizeof(*mPinsForDir); j++) {
@@ -235,13 +238,13 @@ static void dispPrvLcdInit(void)
 	uint_fast8_t i;
 	
 	//reset
-	sio_hw->gpio_clr = 1 << PIN_LCD_RESET;
+	sio_hw->gpio_clr = 1 << mPins.reset;
 	sleep_ms(50);
-	sio_hw->gpio_set = 1 << PIN_LCD_RESET;
+	sio_hw->gpio_set = 1 << mPins.reset;
 	sleep_ms(50);
 
-	sio_hw->gpio_set = 1 << PIN_LCD_DnC;
-	sio_hw->gpio_set = 1 << PIN_LCD_CS;
+	sio_hw->gpio_set = 1 << mPins.dnc;
+	sio_hw->gpio_set = 1 << mPins.cs;
 
 	for (i = 0; i < sizeof(mInitSeq) / sizeof(*mInitSeq); i++) {
 		if (mInitSeq[i] >> 15)
@@ -288,8 +291,8 @@ static void dispPrvTurnOff(void)
 	}
 
 	dipPrvPinsSetup(false);
-	sio_hw->gpio_set = (1 << PIN_LCD_CS);
-	sio_hw->gpio_clr = (1 << PIN_SPI_CLK) | (1 << PIN_SPI_MOSI);
+	sio_hw->gpio_set = (1 << mPins.cs);
+	sio_hw->gpio_clr = (1 << mPins.sck) | (1 << mPins.mosi);
 }
 
 static void dispPrvTurnOn(void)
@@ -423,7 +426,7 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 
         dipPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
-	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
+	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
 	dipPrvPinsSetup(true);
 
 	static uintptr_t bufs[DISPLAY_HEIGHT + 1];
@@ -489,7 +492,7 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 	// Setup drawing area for full screen
 	dipPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
-	sio_hw->gpio_set = 1 << PIN_LCD_DnC;	//data from now on
+	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
 	dipPrvPinsSetup(true);
 	
 	// Configure DMA channel 3 to send color directly to sm[1]
@@ -508,8 +511,32 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 	return &dmaTransfer;
 }
 
-bool dispInit(void)
+bool dispInit(const struct dispPinout *pins)
 {
+	if (!pins)
+		return false;
+
+	const uint8_t all[] = {pins->dnc, pins->cs, pins->sck,
+	                       pins->mosi, pins->miso, pins->reset};
+	uint_fast8_t i;
+
+	//every pin is addressed as 1 << pin through SIO's low bank, and the PIO
+	//base fields are 5 bits wide, so nothing above 31 can work here
+	for (i = 0; i < sizeof(all) / sizeof(*all); i++) {
+		if (all[i] > 31)
+			return false;
+	}
+
+	//SM1 side-sets two bits based at CS, which makes SCK structurally CS + 1.
+	//Wired otherwise the panel is simply dark, with nothing to read: worth a
+	//refusal rather than a debugging session.
+	if (pins->sck != pins->cs + 1)
+		return false;
+
+	mPins = *pins;
+
 	printf("Init: display is %u x %u\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
 	dispPrvTurnOn();
+
+	return true;
 }

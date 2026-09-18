@@ -41,9 +41,22 @@ struct Rect {
 	uint16_t height;
 };
 
+//How the panel is wired. Passed to dispInit(), which keeps a copy - so a stack
+//local is fine - and is the driver's only source of pin numbers. Two rules:
+//every pin must be 0..31, and SCK must be CS + 1, because SM1 side-sets two
+//bits based at CS. dispInit() returns false rather than lighting nothing.
+struct dispPinout {
+	uint8_t dnc;		//data / command select
+	uint8_t cs;		//active low; also the PIO sideset base
+	uint8_t sck;		//must be cs + 1
+	uint8_t mosi;
+	uint8_t miso;		//configured, never read: the panel is write-only here
+	uint8_t reset;		//active low
+};
+
 struct dmaTransfer;
 
-bool dispInit();
+bool dispInit(const struct dispPinout *pins);
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
 bool dispSetClipArea(const struct Rect *rect);
 struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
