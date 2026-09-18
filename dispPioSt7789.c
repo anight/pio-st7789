@@ -48,6 +48,29 @@
 
 static uint16_t __attribute__((aligned(512))) mClut[256];		//MUST be 512 bytes aligned
 
+/* Panel bit depth: 8 (indexed through mClut) or 16 (RGB565 straight from the
+ * caller's buffer). Ported from Dmitry Grinberg's original driver, which
+ * supported 1/2/4/8/16 and which this fork had reduced to 8 alone.
+ *
+ * The two differ only in how a pixel reaches SM1. SM1 is the SPI shifter and is
+ * the same program in both: autopull at 16, OSR shifting left, one OUT per bit.
+ * At 8bpp a byte goes to SM0, which turns it into a CLUT address, and a DMA pair
+ * fetches the RGB565 entry into SM1. At 16bpp the framebuffer already holds what
+ * SM1 wants, so the data DMA writes it there itself and SM0 and the lookup chain
+ * are not used at all.
+ *
+ * A halfword write to a 32-bit FIFO register is replicated across both halves of
+ * the bus, so a 16-bit push lands in OSR as 0xCCCCCCCC-style duplicate; shifting
+ * left from bit 31 therefore emits the correct 16 bits and the pull threshold
+ * refills after exactly those. That replication is what makes 16bpp need no
+ * repacking on the CPU - and dispDrawOneColor() has always relied on it.
+ *
+ * Fixed at dispInit(). The original driver let an application change depth while
+ * running, which cost it a dispSetDepth() that had to tear down and rebuild the
+ * DMA wiring safely; nothing here wants that. A client knows at start-up whether
+ * it draws indexed or direct colour, and one of the two is dead code for it. */
+static uint8_t mDepth = 8;
+
 /* How this panel is wired, as dispInit() was given it. A copy, so the caller
  * may pass a stack local, and the driver's only source of pin numbers. */
 static struct dispPinout mPins;
@@ -102,6 +125,46 @@ static void lcdPrvWriteData(uint8_t val)
 }
 
 
+/*
+ * SM1: the SPI shifter, and the one piece both depths share.
+ *
+ * Takes 16-bit words, shifts them out MSB first on MOSI with the clock on
+ * sideset. Autopull at 16 bits means one OUT per bit is all the program needs;
+ * X counts a chunk of pixels and the wrap re-initialises it, so the machine
+ * sustains itself for as long as data keeps arriving.
+ *
+ * Who supplies that data is the whole difference between 8bpp and 16bpp, and it
+ * is a property of the DMA wiring rather than of this program - which is why
+ * this function is identical in both and the depth never reaches PIO.
+ */
+static uint_fast8_t dispPrvPioSm1SpiProgram(uint_fast8_t pc, uint_fast8_t *startPC, uint_fast8_t *endPC)
+{
+	uint_fast8_t lblPullNgo, lblMoreBits;
+
+	*startPC = pc;
+	pio0_hw->instr_mem[pc++] = I_SET(0, 4, SET_DST_X, 0x0f);
+	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_ISR, MOV_OP_COPY, MOV_SRC_X);
+	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 9);
+	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_X, MOV_OP_COPY, MOV_SRC_ISR);
+	lblPullNgo = pc;
+	pio0_hw->instr_mem[pc++] = I_SET(0, 0, SET_DST_Y, 15);
+	lblMoreBits = pc;
+	pio0_hw->instr_mem[pc++] = I_OUT(0, 4, OUT_DST_PINS, 1);
+	pio0_hw->instr_mem[pc++] = I_JMP(0, 6, JMP_Y_POSTDEC, lblMoreBits);	//1 cy delay after here no matter if we jumped
+	pio0_hw->instr_mem[pc++] = I_JMP(0, 4, JMP_X_POSTDEC, lblPullNgo);
+	*endPC = pc - 1;	//that was the last instr
+
+	return pc;
+}
+
+static void dispPrvPioSm1Configure(uint_fast8_t sm1StartPC, uint_fast8_t sm1EndPC)
+{
+	pio0_hw->sm[1].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
+	pio0_hw->sm[1].execctrl = (pio0_hw->sm[1].execctrl &~ (PIO_SM0_EXECCTRL_WRAP_TOP_BITS | PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS | PIO_SM2_EXECCTRL_SIDE_EN_BITS)) | (sm1EndPC << PIO_SM0_EXECCTRL_WRAP_TOP_LSB) | (sm1StartPC << PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB) | (SIDE_SET_HAS_ENABLE_BIT ? PIO_SM2_EXECCTRL_SIDE_EN_BITS : 0);
+	pio0_hw->sm[1].shiftctrl = (pio0_hw->sm[1].shiftctrl &~ (PIO_SM1_SHIFTCTRL_PULL_THRESH_BITS | PIO_SM1_SHIFTCTRL_PUSH_THRESH_BITS | PIO_SM0_SHIFTCTRL_IN_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_AUTOPUSH_BITS)) | PIO_SM0_SHIFTCTRL_AUTOPULL_BITS | (16 << PIO_SM1_SHIFTCTRL_PULL_THRESH_LSB);
+	pio0_hw->sm[1].pinctrl = (SIDE_SET_BITS_USED << PIO_SM1_PINCTRL_SIDESET_COUNT_LSB) | (1 << PIO_SM1_PINCTRL_OUT_COUNT_LSB) | (mPins.miso << PIO_SM1_PINCTRL_IN_BASE_LSB) | (mPins.cs << PIO_SM1_PINCTRL_SIDESET_BASE_LSB) | (mPins.mosi << PIO_SM1_PINCTRL_OUT_BASE_LSB);
+}
+
 static void dispPrvPioProgram8bpp(void)
 {
 	/*  For one-shot mode:
@@ -126,22 +189,9 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_X, 32 - 9);
 	sm0EndPC = pc - 1;	//that was the last instr
 
-	//SM1 program: SPI the data out. input 16 bit words (from DMA used for CLUT lookup)
-	//OSR shifts left, ISR shifts left, sideset used for clock, data output to MOSI using OUT
-	
-	sm1StartPC = pc;
-	pio0_hw->instr_mem[pc++] = I_SET(0, 4, SET_DST_X, 0x0f);
-	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_ISR, MOV_OP_COPY, MOV_SRC_X);
-	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 9);
-	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_X, MOV_OP_COPY, MOV_SRC_ISR);
-	lblPullNgo = pc;
-	pio0_hw->instr_mem[pc++] = I_SET(0, 0, SET_DST_Y, 15);
-	lblMoreBits = pc;
-	pio0_hw->instr_mem[pc++] = I_OUT(0, 4, OUT_DST_PINS, 1);
-	pio0_hw->instr_mem[pc++] = I_JMP(0, 6, JMP_Y_POSTDEC, lblMoreBits);	//1 cy delay after here no matter if we jumped
-	pio0_hw->instr_mem[pc++] = I_JMP(0, 4, JMP_X_POSTDEC, lblPullNgo);
-
-	sm1EndPC = pc - 1;	//that was the last instr
+	//SM1 program: SPI the data out. input 16 bit words - from the CLUT-lookup
+	//DMA pair at 8bpp, straight from the caller's framebuffer at 16bpp.
+	pc = dispPrvPioSm1SpiProgram(pc, &sm1StartPC, &sm1EndPC);
 
 	printf("LCD: PIO programs created. %u instrs\n", pc);
 	printf("LCD: PIO prog 0 is %u..%u, 1 is %u..%u\n", sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC);
@@ -156,11 +206,7 @@ static void dispPrvPioProgram8bpp(void)
 	pio0_hw->sm[0].instr = I_PULL(0, 0, 0, 0);
 	pio0_hw->sm[0].instr = I_OUT(0, 0, OUT_DST_X, 32);	
 	
-	//configure sm1
-	pio0_hw->sm[1].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
-	pio0_hw->sm[1].execctrl = (pio0_hw->sm[1].execctrl &~ (PIO_SM0_EXECCTRL_WRAP_TOP_BITS | PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS | PIO_SM2_EXECCTRL_SIDE_EN_BITS)) | (sm1EndPC << PIO_SM0_EXECCTRL_WRAP_TOP_LSB) | (sm1StartPC << PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB) | (SIDE_SET_HAS_ENABLE_BIT ? PIO_SM2_EXECCTRL_SIDE_EN_BITS : 0);
-	pio0_hw->sm[1].shiftctrl = (pio0_hw->sm[1].shiftctrl &~ (PIO_SM1_SHIFTCTRL_PULL_THRESH_BITS | PIO_SM1_SHIFTCTRL_PUSH_THRESH_BITS | PIO_SM0_SHIFTCTRL_IN_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_AUTOPUSH_BITS)) | PIO_SM0_SHIFTCTRL_AUTOPULL_BITS | (16 << PIO_SM1_SHIFTCTRL_PULL_THRESH_LSB);
-	pio0_hw->sm[1].pinctrl = (SIDE_SET_BITS_USED << PIO_SM1_PINCTRL_SIDESET_COUNT_LSB) | (1 << PIO_SM1_PINCTRL_OUT_COUNT_LSB) | (mPins.miso << PIO_SM1_PINCTRL_IN_BASE_LSB) | (mPins.cs << PIO_SM1_PINCTRL_SIDESET_BASE_LSB) | (mPins.mosi << PIO_SM1_PINCTRL_OUT_BASE_LSB);
+	dispPrvPioSm1Configure(sm1StartPC, sm1EndPC);
 	
 	//start sm0..sm2
 	pio0_hw->sm[0].instr = I_JMP(0, 0, JMP_ALWAYS, sm0StartPC);
@@ -176,6 +222,45 @@ static void dispPrvPioProgram8bpp(void)
 	dma_hw->ch[1].write_addr = (uintptr_t)&dma_hw->ch[0].al3_read_addr_trig;
 	dma_hw->ch[1].transfer_count = 1;
 	dma_hw->ch[1].ctrl_trig = (DREQ_PIO0_RX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
+}
+
+/*
+ * 16bpp: RGB565 straight from the caller's buffer.
+ *
+ * Grinberg's note on this mode in the original driver is "things are simple
+ * here", and they are: the panel is already in RGB565, so the framebuffer holds
+ * exactly the bytes SM1 shifts out. SM0 and the two lookup channels that make
+ * 8bpp work have nothing to do, so they are simply not started - the data DMA in
+ * dispDrawBuffer16() writes halfwords to SM1's FIFO itself.
+ *
+ * Leaving SM0 stopped matters rather than being tidiness. Its 8bpp program ends
+ * by pushing a CLUT address to its RX FIFO, and ch1 is armed on DREQ_PIO0_RX0;
+ * an SM0 left running with stale TX data would hand ch1 an address, ch1 would
+ * hand it to ch0, and ch0 would write a CLUT entry into the middle of our pixel
+ * stream. The one-line fix is to not enable it.
+ */
+static void dispPrvPioProgram16bpp(void)
+{
+	uint_fast8_t pc = 0, sm1StartPC, sm1EndPC;
+
+	pc = dispPrvPioSm1SpiProgram(pc, &sm1StartPC, &sm1EndPC);
+
+	printf("LCD: PIO program created (16bpp). %u instrs\n", pc);
+	printf("LCD: PIO prog 1 is %u..%u\n", sm1StartPC, sm1EndPC);
+
+	dispPrvPioSm1Configure(sm1StartPC, sm1EndPC);
+
+	pio0_hw->sm[1].instr = I_JMP(0, 0, JMP_ALWAYS, sm1StartPC);
+	pio0_hw->ctrl |= (2 << PIO_CTRL_SM_ENABLE_LSB);  // Enable SM1 only
+
+	/* ch0/ch1 are the CLUT lookup pair and stay disarmed here. dispPrvPioSetup()
+	 * resets PIO0 but not the DMA, so clear them explicitly: a depth switch must
+	 * not leave a channel armed on a DREQ that is about to mean something else. */
+	dma_hw->ch[0].al1_ctrl = 0;
+	dma_hw->ch[1].al1_ctrl = 0;
+	dma_hw->abort = (1 << 0) | (1 << 1);
+	while (dma_hw->abort);
+	while (dma_channel_is_busy(0) || dma_channel_is_busy(1));
 }
 
 static void dipPrvPinsSetup(bool forPio)		//uses SM0. only safe while SM0 is stopped
@@ -221,7 +306,10 @@ static void dispPrvPioSetup(void)
 	
 	dipPrvPinsSetup(true);
 	
-	dispPrvPioProgram8bpp();
+	if (mDepth == 16)
+		dispPrvPioProgram16bpp();
+	else
+		dispPrvPioProgram8bpp();
 }
 
 static void dispPrvLcdInit(void)
@@ -372,6 +460,11 @@ struct dmaTransfer {
 
 static struct dmaTransfer dmaTransfer = {0};
 
+/* Row start addresses for a push whose source stride is wider than the rectangle,
+ * walked by ch3 and terminated by a zero. Shared by both depths because only one
+ * transfer is ever in flight - every entry point waits for the previous one. */
+static uintptr_t bufs[DISPLAY_HEIGHT + 1];
+
 bool clipArea(const struct Rect *rect, struct Rect *clipRect)
 {
 	// Clip the draw area to mClipArea
@@ -429,8 +522,6 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
 	dipPrvPinsSetup(true);
 
-	static uintptr_t bufs[DISPLAY_HEIGHT + 1];
-
 	if (sourceStrideMismatch) {
 		uint32_t i;
 		uintptr_t addr = (uintptr_t)adjustedFb;
@@ -451,6 +542,83 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 
 	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[0];
 	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
+	dma_hw->ch[3].transfer_count = 1;
+	dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
+	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dmaTransfer.is_working = true;
+	return &dmaTransfer;
+}
+
+/*
+ * Push a rectangle of an RGB565 buffer.
+ *
+ * The 16bpp counterpart of dispDrawBuffer(), and the reason the depth exists: a
+ * renderer that already works in RGB565 - which is what the panel wants - hands
+ * its framebuffer over untouched and no CPU cycle is spent on a pixel. At 8bpp
+ * the same picture would have to be quantised to 256 colours first.
+ *
+ * `stride` is in pixels, not bytes, which is the unit a caller with a uint16_t*
+ * already has. The rest is dispDrawBuffer(): clip, set the draw area, then let
+ * ch2 move the data and ch3 walk the row addresses when the source is wider than
+ * the rectangle.
+ *
+ * The one difference in the DMA is where the data goes. At 8bpp ch2 feeds SM0,
+ * which produces a CLUT address that another pair of channels turns into a
+ * colour. Here ch2 writes halfwords straight to SM1's FIFO - the same place
+ * dispDrawOneColor() has always written - so the lookup chain is bypassed
+ * entirely rather than being fed something it would misread.
+ */
+struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride)
+{
+	(void)size;
+
+	if (mDepth != 16)
+		return NULL;
+
+	if (dmaTransfer.is_working) {
+		dispDmaTransferWaitFinish(&dmaTransfer);
+	}
+
+	struct Rect clipRect;
+	if (!clipArea(rect, &clipRect)) {
+		return NULL;
+	}
+
+	//stride and the clip offsets are in pixels here; one pixel is one uint16_t
+	uint16_t* adjustedFb = (uint16_t*)framebuffer + ((clipRect.y - rect->y) * (uint32_t)stride) + (clipRect.x - rect->x);
+
+	uint32_t newSize = clipRect.height * clipRect.width;
+
+	bool sourceStrideMismatch = clipRect.width != stride;
+
+	dipPrvPinsSetup(false);
+	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
+	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
+	dipPrvPinsSetup(true);
+
+	if (sourceStrideMismatch) {
+		uint32_t i;
+		uintptr_t addr = (uintptr_t)adjustedFb;
+		for (i = 0; i < clipRect.height; i++, addr += (uint32_t)stride * sizeof(uint16_t)) {
+			bufs[i] = addr;
+		}
+		bufs[i] = 0;
+		dma_hw->ch[2].transfer_count = clipRect.width;
+		dmaTransfer.ch2_end_read_addr = 0;
+		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[clipRect.height+1];
+	} else {
+		bufs[0] = (uintptr_t)adjustedFb;
+		bufs[1] = 0;
+		dma_hw->ch[2].transfer_count = newSize;
+		dmaTransfer.ch2_end_read_addr = 0;
+		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
+	}
+
+	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[1];
+	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
 	dma_hw->ch[3].transfer_count = 1;
@@ -511,9 +679,12 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 	return &dmaTransfer;
 }
 
-bool dispInit(const struct dispPinout *pins)
+bool dispInit(const struct dispPinout *pins, uint8_t bpp)
 {
 	if (!pins)
+		return false;
+
+	if (bpp != 8 && bpp != 16)
 		return false;
 
 	const uint8_t all[] = {pins->dnc, pins->cs, pins->sck,
@@ -534,8 +705,9 @@ bool dispInit(const struct dispPinout *pins)
 		return false;
 
 	mPins = *pins;
+	mDepth = bpp;
 
-	printf("Init: display is %u x %u\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+	printf("Init: display is %u x %u, %ubpp\n", DISPLAY_WIDTH, DISPLAY_HEIGHT, bpp);
 	dispPrvTurnOn();
 
 	return true;

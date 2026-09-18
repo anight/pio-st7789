@@ -56,10 +56,25 @@ struct dispPinout {
 
 struct dmaTransfer;
 
-bool dispInit(const struct dispPinout *pins);
+//`bpp` picks how pixels reach the panel and is fixed for the life of the driver:
+//  8   one byte per pixel, expanded through the CLUT by the PIO - dispDrawBuffer()
+//  16  RGB565 as-is, no lookup and no CPU in the path - dispDrawBuffer16()
+//Either way the panel itself runs in RGB565. False on a bad pinout (see above) or
+//a bpp that is neither 8 nor 16.
+bool dispInit(const struct dispPinout *pins, uint8_t bpp);
+
+//Only meaningful at 8bpp, but always safe to call: it writes plain memory.
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
+
 bool dispSetClipArea(const struct Rect *rect);
+
+//8bpp. `stride` is in bytes. NULL if the rectangle clips away entirely.
 struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
+
+//16bpp. RGB565 handed to the panel untouched, no CLUT and no CPU in the path.
+//`stride` is in PIXELS, not bytes. NULL if the rectangle clips away entirely, or
+//if dispInit() was not given 16.
+struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
 struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect);
 void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer);
 void dispDebugPrintStatus(void);
