@@ -37,6 +37,7 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
+#include "hardware/pio.h"
 
 #include "dispPioSt7789.h"
 
@@ -74,6 +75,27 @@ static uint8_t mDepth = 8;
 /* How this panel is wired, as dispInit() was given it. A copy, so the caller
  * may pass a stack local, and the driver's only source of pin numbers. */
 static struct dispPinout mPins;
+
+/*
+ * The PIO block and the two state machines, held rather than hardcoded.
+ *
+ * Everything here goes through the SDK - pio_claim_unused_sm(), pio_add_program(),
+ * pio_sm_init() - so the allocator knows what is taken and another driver can be
+ * given what is left. Writing the registers directly means the SDK believes all
+ * four machines and all 32 instruction slots are free, and hands a second driver
+ * one of these.
+ *
+ * mSmExpand is claimed at both depths even though only 8bpp runs a program on it.
+ * It is also the machine that executes the SET PINDIRS behind pin setup, and that
+ * has to be a machine other than the SPI shifter: pio_sm_set_*_with_mask()
+ * overwrites PINCTRL for the duration, and doing that to the shifter mid-frame
+ * would point its OUT and sideset at the wrong pins for a few cycles.
+ */
+static PIO  mPio = pio0;
+static uint mSmExpand;      /* 8bpp CLUT address generator; scratch at 16bpp */
+static uint mSmSpi;         /* the SPI shifter, both depths                  */
+static uint mOffExpand;
+static uint mOffSpi;
 
 static struct Rect mClipArea = {0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT};
 
@@ -137,32 +159,116 @@ static void lcdPrvWriteData(uint8_t val)
  * is a property of the DMA wiring rather than of this program - which is why
  * this function is identical in both and the depth never reaches PIO.
  */
-static uint_fast8_t dispPrvPioSm1SpiProgram(uint_fast8_t pc, uint_fast8_t *startPC, uint_fast8_t *endPC)
+#define SPI_PROG_LEN      8
+#define EXPAND_PROG_LEN   5
+
+/*
+ * Jump targets are program-relative, not absolute PCs.
+ *
+ * pio_add_program() picks the offset and adds it to every JMP as it copies the
+ * program in, so a label here counts from the start of the array. That is the
+ * whole reason the programs can go anywhere, and the reason the SDK can be told
+ * what they occupy.
+ */
+#define SPI_LBL_PULL_N_GO   4
+#define SPI_LBL_MORE_BITS   5
+
+static const uint16_t mSpiProgInstrs[SPI_PROG_LEN] = {
+	I_SET(0, 4, SET_DST_X, 0x0f),
+	I_MOV(0, 0, MOV_DST_ISR, MOV_OP_COPY, MOV_SRC_X),
+	I_IN(0, 0, IN_SRC_ZEROES, 9),
+	I_MOV(0, 0, MOV_DST_X, MOV_OP_COPY, MOV_SRC_ISR),
+	I_SET(0, 0, SET_DST_Y, 15),                             /* SPI_LBL_PULL_N_GO */
+	I_OUT(0, 4, OUT_DST_PINS, 1),                           /* SPI_LBL_MORE_BITS */
+	I_JMP(0, 6, JMP_Y_POSTDEC, SPI_LBL_MORE_BITS),          /* 1 cy delay after here either way */
+	I_JMP(0, 4, JMP_X_POSTDEC, SPI_LBL_PULL_N_GO),
+};
+
+static const struct pio_program mSpiProg = {
+	.instructions = mSpiProgInstrs,
+	.length       = SPI_PROG_LEN,
+	.origin       = -1,
+	.pio_version  = 0,
+#if PICO_PIO_VERSION > 0
+	.used_gpio_ranges = 0x1,        /* every pin this drives is below 16 */
+#endif
+};
+
+/*
+ * SM0: turn a byte into a CLUT address. In 8bpp only.
+ *
+ * Input byte ??, output CLUT_BASE + ?? * 2, with CLUT_BASE >> 9 preloaded into X.
+ * Shifts right both ways, autopush and autopull at 32.
+ */
+static const uint16_t mExpandProgInstrs[EXPAND_PROG_LEN] = {
+	I_OUT(0, 0, OUT_DST_Y, 8),
+	I_OUT(0, 0, OUT_DST_NULL, 24),
+	I_IN(0, 0, IN_SRC_ZEROES, 1),
+	I_IN(0, 0, IN_SRC_Y, 8),
+	I_IN(0, 0, IN_SRC_X, 32 - 9),
+};
+
+static const struct pio_program mExpandProg = {
+	.instructions = mExpandProgInstrs,
+	.length       = EXPAND_PROG_LEN,
+	.origin       = -1,
+	.pio_version  = 0,
+#if PICO_PIO_VERSION > 0
+	.used_gpio_ranges = 0,          /* drives no pins at all */
+#endif
+};
+
+/*
+ * SM1: the SPI shifter, and the one piece both depths share.
+ *
+ * Takes 16-bit words, shifts them out MSB first on MOSI with the clock on
+ * sideset. Autopull at 16 bits means one OUT per bit is all the program needs;
+ * X counts a chunk of pixels and the wrap re-initialises it, so the machine
+ * sustains itself for as long as data keeps arriving.
+ *
+ * Who supplies that data is the whole difference between 8bpp and 16bpp, and it
+ * is a property of the DMA wiring rather than of this program - which is why
+ * this is identical in both and the depth never reaches PIO.
+ *
+ * SIDE_SET_BITS_USED is three: two clock bits and the enable bit that makes
+ * side-setting optional per instruction, which is what `optional` means here.
+ */
+static void dispPrvSpiSmConfigure(void)
 {
-	uint_fast8_t lblPullNgo, lblMoreBits;
+	pio_sm_config c = pio_get_default_sm_config();
 
-	*startPC = pc;
-	pio0_hw->instr_mem[pc++] = I_SET(0, 4, SET_DST_X, 0x0f);
-	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_ISR, MOV_OP_COPY, MOV_SRC_X);
-	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 9);
-	pio0_hw->instr_mem[pc++] = I_MOV(0, 0, MOV_DST_X, MOV_OP_COPY, MOV_SRC_ISR);
-	lblPullNgo = pc;
-	pio0_hw->instr_mem[pc++] = I_SET(0, 0, SET_DST_Y, 15);
-	lblMoreBits = pc;
-	pio0_hw->instr_mem[pc++] = I_OUT(0, 4, OUT_DST_PINS, 1);
-	pio0_hw->instr_mem[pc++] = I_JMP(0, 6, JMP_Y_POSTDEC, lblMoreBits);	//1 cy delay after here no matter if we jumped
-	pio0_hw->instr_mem[pc++] = I_JMP(0, 4, JMP_X_POSTDEC, lblPullNgo);
-	*endPC = pc - 1;	//that was the last instr
+	sm_config_set_wrap(&c, mOffSpi, mOffSpi + SPI_PROG_LEN - 1);
+	sm_config_set_sideset(&c, SIDE_SET_BITS_USED, true, false);
+	sm_config_set_sideset_pins(&c, mPins.cs);
+	sm_config_set_out_pins(&c, mPins.mosi, 1);
+	sm_config_set_in_pins(&c, mPins.miso);
+	/* Shift left, autopull at 16: a halfword written to the 32-bit FIFO is
+	 * replicated across both halves, so shifting from bit 31 emits the right
+	 * 16 bits and the threshold refills after exactly those. */
+	sm_config_set_out_shift(&c, false, true, 16);
+	sm_config_set_in_shift(&c, false, false, 32);
+	sm_config_set_clkdiv_int_frac(&c, 1, 0);
 
-	return pc;
+	pio_sm_init(mPio, mSmSpi, mOffSpi, &c);
 }
 
-static void dispPrvPioSm1Configure(uint_fast8_t sm1StartPC, uint_fast8_t sm1EndPC)
+static void dispPrvExpandSmConfigure(void)
 {
-	pio0_hw->sm[1].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
-	pio0_hw->sm[1].execctrl = (pio0_hw->sm[1].execctrl &~ (PIO_SM0_EXECCTRL_WRAP_TOP_BITS | PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS | PIO_SM2_EXECCTRL_SIDE_EN_BITS)) | (sm1EndPC << PIO_SM0_EXECCTRL_WRAP_TOP_LSB) | (sm1StartPC << PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB) | (SIDE_SET_HAS_ENABLE_BIT ? PIO_SM2_EXECCTRL_SIDE_EN_BITS : 0);
-	pio0_hw->sm[1].shiftctrl = (pio0_hw->sm[1].shiftctrl &~ (PIO_SM1_SHIFTCTRL_PULL_THRESH_BITS | PIO_SM1_SHIFTCTRL_PUSH_THRESH_BITS | PIO_SM0_SHIFTCTRL_IN_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_AUTOPUSH_BITS)) | PIO_SM0_SHIFTCTRL_AUTOPULL_BITS | (16 << PIO_SM1_SHIFTCTRL_PULL_THRESH_LSB);
-	pio0_hw->sm[1].pinctrl = (SIDE_SET_BITS_USED << PIO_SM1_PINCTRL_SIDESET_COUNT_LSB) | (1 << PIO_SM1_PINCTRL_OUT_COUNT_LSB) | (mPins.miso << PIO_SM1_PINCTRL_IN_BASE_LSB) | (mPins.cs << PIO_SM1_PINCTRL_SIDESET_BASE_LSB) | (mPins.mosi << PIO_SM1_PINCTRL_OUT_BASE_LSB);
+	pio_sm_config c = pio_get_default_sm_config();
+
+	sm_config_set_wrap(&c, mOffExpand, mOffExpand + EXPAND_PROG_LEN - 1);
+	sm_config_set_out_shift(&c, true, true, 32);
+	sm_config_set_in_shift(&c, true, true, 32);
+	sm_config_set_clkdiv_int_frac(&c, 1, 0);
+
+	pio_sm_init(mPio, mSmExpand, mOffExpand, &c);
+
+	/* Hand it the CLUT base. pio_sm_init() has just cleared the FIFOs, so this
+	 * has to follow it, and the two exec'd instructions move the value into X
+	 * without disturbing the PC that init set. */
+	pio_sm_put(mPio, mSmExpand, ((uintptr_t)mClut) >> 9);
+	pio_sm_exec(mPio, mSmExpand, pio_encode_pull(false, false));
+	pio_sm_exec(mPio, mSmExpand, pio_encode_out(pio_x, 32));
 }
 
 static void dispPrvPioProgram8bpp(void)
@@ -176,52 +282,25 @@ static void dispPrvPioProgram8bpp(void)
 	    sm1: spi 16bpp pixel
 	*/
 
-	uint_fast8_t pc = 0, lblMore, lblPullNgo, lblMoreBits, sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC;
-	
-	//SM0 expand and request palette entry. basically input byte ??, output CLUT_BASE + (?? * 2), where CLUT_BASE is preset in register X
-	//expects X to be clut addr >> 9. input shift shifts right, output shifts right. autopush at 32, autopull at 32
-	//waits for IRQ for pushback from second SM
-	sm0StartPC = pc;
-	pio0_hw->instr_mem[pc++] = I_OUT(0, 0, OUT_DST_Y, 8);
-	pio0_hw->instr_mem[pc++] = I_OUT(0, 0, OUT_DST_NULL, 24);
-	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_ZEROES, 1);
-	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_Y, 8);
-	pio0_hw->instr_mem[pc++] = I_IN(0, 0, IN_SRC_X, 32 - 9);
-	sm0EndPC = pc - 1;	//that was the last instr
+	printf("LCD: PIO programs at %u..%u (expand) and %u..%u (spi), SM%u and SM%u\n",
+	       mOffExpand, mOffExpand + EXPAND_PROG_LEN - 1,
+	       mOffSpi, mOffSpi + SPI_PROG_LEN - 1, mSmExpand, mSmSpi);
 
-	//SM1 program: SPI the data out. input 16 bit words - from the CLUT-lookup
-	//DMA pair at 8bpp, straight from the caller's framebuffer at 16bpp.
-	pc = dispPrvPioSm1SpiProgram(pc, &sm1StartPC, &sm1EndPC);
+	dispPrvExpandSmConfigure();
+	dispPrvSpiSmConfigure();
 
-	printf("LCD: PIO programs created. %u instrs\n", pc);
-	printf("LCD: PIO prog 0 is %u..%u, 1 is %u..%u\n", sm0StartPC, sm0EndPC, sm1StartPC, sm1EndPC);
-	
-	//configure sm0
-	pio0_hw->sm[0].clkdiv = (1 << PIO_SM0_CLKDIV_INT_LSB);	//full speed
-	pio0_hw->sm[0].execctrl = (pio0_hw->sm[0].execctrl &~ (PIO_SM0_EXECCTRL_WRAP_TOP_BITS | PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS | PIO_SM2_EXECCTRL_SIDE_EN_BITS)) | (sm0EndPC << PIO_SM0_EXECCTRL_WRAP_TOP_LSB) | (sm0StartPC << PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB) | (SIDE_SET_HAS_ENABLE_BIT ? PIO_SM2_EXECCTRL_SIDE_EN_BITS : 0);
-	pio0_hw->sm[0].shiftctrl = (pio0_hw->sm[0].shiftctrl &~ (PIO_SM0_SHIFTCTRL_PULL_THRESH_BITS | PIO_SM1_SHIFTCTRL_PUSH_THRESH_BITS)) | PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_IN_SHIFTDIR_BITS | PIO_SM0_SHIFTCTRL_AUTOPULL_BITS | PIO_SM0_SHIFTCTRL_AUTOPUSH_BITS;
-	
-	//give SM0 the clut address
-	pio0_hw->txf[0] = ((uintptr_t)mClut) >> 9;
-	pio0_hw->sm[0].instr = I_PULL(0, 0, 0, 0);
-	pio0_hw->sm[0].instr = I_OUT(0, 0, OUT_DST_X, 32);	
-	
-	dispPrvPioSm1Configure(sm1StartPC, sm1EndPC);
-	
-	//start sm0..sm2
-	pio0_hw->sm[0].instr = I_JMP(0, 0, JMP_ALWAYS, sm0StartPC);
-	pio0_hw->sm[1].instr = I_JMP(0, 0, JMP_ALWAYS, sm1StartPC);
-	pio0_hw->ctrl |= (3 << PIO_CTRL_SM_ENABLE_LSB);  // Enable SM0, SM1 only
+	/* Both at once, so neither runs against a half-configured partner. */
+	pio_set_sm_mask_enabled(mPio, (1u << mSmExpand) | (1u << mSmSpi), true);
 
 	//ch1 (first) RXes a word from SM0s output and writes to ch0's source reg. then triggers ch0. ch0 then DMAs a single 16 bit CLUT value to SM1's input, triggers ch1 again
-	dma_hw->ch[0].write_addr = (uintptr_t)&pio0_hw->txf[1];
+	dma_hw->ch[0].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
 	dma_hw->ch[0].transfer_count = 1;
-	dma_hw->ch[0].al1_ctrl = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[0].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 	
-	dma_hw->ch[1].read_addr = (uintptr_t)&pio0_hw->rxf[0];
+	dma_hw->ch[1].read_addr = (uintptr_t)&mPio->rxf[mSmExpand];
 	dma_hw->ch[1].write_addr = (uintptr_t)&dma_hw->ch[0].al3_read_addr_trig;
 	dma_hw->ch[1].transfer_count = 1;
-	dma_hw->ch[1].ctrl_trig = (DREQ_PIO0_RX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
+	dma_hw->ch[1].ctrl_trig = (pio_get_dreq(mPio, mSmExpand, false) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
 }
 
 /*
@@ -233,29 +312,23 @@ static void dispPrvPioProgram8bpp(void)
  * 8bpp work have nothing to do, so they are simply not started - the data DMA in
  * dispDrawBuffer16() writes halfwords to SM1's FIFO itself.
  *
- * Leaving SM0 stopped matters rather than being tidiness. Its 8bpp program ends
- * by pushing a CLUT address to its RX FIFO, and ch1 is armed on DREQ_PIO0_RX0;
- * an SM0 left running with stale TX data would hand ch1 an address, ch1 would
- * hand it to ch0, and ch0 would write a CLUT entry into the middle of our pixel
- * stream. The one-line fix is to not enable it.
+ * Leaving the expander machine stopped matters rather than being tidiness. Its
+ * 8bpp program ends by pushing a CLUT address to its RX FIFO, and ch1 is armed
+ * on that machine's RX DREQ; left running with stale TX data it would hand ch1
+ * an address, ch1 would hand it to ch0, and ch0 would write a CLUT entry into
+ * the middle of the pixel stream. The one-line fix is to not enable it.
  */
 static void dispPrvPioProgram16bpp(void)
 {
-	uint_fast8_t pc = 0, sm1StartPC, sm1EndPC;
+	printf("LCD: PIO program at %u..%u (spi, 16bpp), SM%u\n",
+	       mOffSpi, mOffSpi + SPI_PROG_LEN - 1, mSmSpi);
 
-	pc = dispPrvPioSm1SpiProgram(pc, &sm1StartPC, &sm1EndPC);
+	dispPrvSpiSmConfigure();
+	pio_sm_set_enabled(mPio, mSmSpi, true);
 
-	printf("LCD: PIO program created (16bpp). %u instrs\n", pc);
-	printf("LCD: PIO prog 1 is %u..%u\n", sm1StartPC, sm1EndPC);
-
-	dispPrvPioSm1Configure(sm1StartPC, sm1EndPC);
-
-	pio0_hw->sm[1].instr = I_JMP(0, 0, JMP_ALWAYS, sm1StartPC);
-	pio0_hw->ctrl |= (2 << PIO_CTRL_SM_ENABLE_LSB);  // Enable SM1 only
-
-	/* ch0/ch1 are the CLUT lookup pair and stay disarmed here. dispPrvPioSetup()
-	 * resets PIO0 but not the DMA, so clear them explicitly: a depth switch must
-	 * not leave a channel armed on a DREQ that is about to mean something else. */
+	/* ch0/ch1 are the CLUT lookup pair and stay disarmed here. Nothing else
+	 * clears them, so do it explicitly: a channel must not be left armed on a
+	 * DREQ that is about to mean something else. */
 	dma_hw->ch[0].al1_ctrl = 0;
 	dma_hw->ch[1].al1_ctrl = 0;
 	dma_hw->abort = (1 << 0) | (1 << 1);
@@ -263,49 +336,70 @@ static void dispPrvPioProgram16bpp(void)
 	while (dma_channel_is_busy(0) || dma_channel_is_busy(1));
 }
 
-static void dipPrvPinsSetup(bool forPio)		//uses SM0. only safe while SM0 is stopped
+/*
+ * Hand the three SPI pins to PIO, or back to SIO for the start-up bit-bang.
+ *
+ * All three are outputs. CS idles high and the other two low, which is what the
+ * panel expects between transfers.
+ *
+ * Directions are PIO's own state, held per pin inside the block and not cleared
+ * by handing the pad to SIO and back, so they are set once when the pins first
+ * become PIO's and not on every switch.
+ *
+ * The SET PINDIRS behind pio_sm_set_*_with_mask() is executed by the expander
+ * machine, never the shifter. Those helpers overwrite PINCTRL and restore it,
+ * and doing that to the shifter while a frame is going out would aim its OUT and
+ * sideset at the wrong pins for as long as it took.
+ */
+static void dispPrvPinsSetup(bool forPio)
 {
-	const uint8_t mPinsForDir[] = {mPins.sck, mPins.mosi, mPins.cs}; //first in others out
+	const uint8_t pins[] = { mPins.sck, mPins.mosi, mPins.cs };
+	const uint32_t mask  = (1u << mPins.sck) | (1u << mPins.mosi) | (1u << mPins.cs);
 	uint_fast8_t j;
-	
-	for (j = 0; j < sizeof(mPinsForDir) / sizeof(*mPinsForDir); j++) {
-		
-		uint32_t pin = mPinsForDir[j];
-		
-		//seems that only PIO can set directions when pins are in PIO mode, so do that, one at a time
-		
-		pio0_hw->sm[0].pinctrl = (pio0_hw->sm[0].pinctrl &~ (PIO_SM1_PINCTRL_SET_BASE_BITS | PIO_SM1_PINCTRL_SET_COUNT_BITS)) | (pin << PIO_SM1_PINCTRL_SET_BASE_LSB) | (1 << PIO_SM1_PINCTRL_SET_COUNT_LSB);
-		pio0_hw->sm[0].instr = I_SET(0, 0, SET_DST_PINDIRS, 1);
-		pio0_hw->sm[0].instr = I_SET(0, 0, SET_DST_PINS, j >= 2);
 
-		/* gpio_set_function, not a raw FUNCSEL poke: on RP2350 that also
-		 * clears the pad isolation latch, and SIO's FUNCSEL constant was
-		 * renamed (SIO_0 -> SIOB_PROC_0). GPIO_FUNC_PIO0 / GPIO_FUNC_SIO
-		 * are the same numbers on both chips. */
-		gpio_set_function(pin, forPio ? GPIO_FUNC_PIO0 : GPIO_FUNC_SIO);
+	for (j = 0; j < sizeof(pins) / sizeof(*pins); j++) {
+		if (forPio) {
+			/* pio_gpio_init, not a raw FUNCSEL poke: on RP2350 it also
+			 * clears the pad isolation latch, and it picks the right
+			 * function for whichever block mPio is. */
+			pio_gpio_init(mPio, pins[j]);
+		} else {
+			gpio_set_function(pins[j], GPIO_FUNC_SIO);
+		}
 	}
 }
 
+/* Once, while every machine is still stopped. */
+static void dispPrvPinDirsSetup(void)
+{
+	const uint32_t mask = (1u << mPins.sck) | (1u << mPins.mosi) | (1u << mPins.cs);
+
+	pio_sm_set_pindirs_with_mask(mPio, mSmExpand, mask, mask);
+	pio_sm_set_pins_with_mask(mPio, mSmExpand, 1u << mPins.cs, mask);
+}
+
+/*
+ * Take what this driver needs and nothing else.
+ *
+ * Claiming the machines and adding the programs through the SDK is what lets a
+ * second driver share the block: the allocator can only avoid what it knows
+ * about. This used to reset the whole PIO block - which wiped every machine and
+ * all 32 slots, co-tenant or not - and then write CTRL whole, which cleared
+ * SM_ENABLE for machines it did not own. pio_sm_init() restarts the machine,
+ * clears its FIFOs and sets its PC, which is what the reset was there to do.
+ */
 static void dispPrvPioSetup(void)
 {
-	uint_fast8_t i;
-	
-	//reset PIO0
-	resets_hw->reset |= RESETS_RESET_PIO0_BITS;		//this is correct... there seems no other way to re-init the PIO properly. "Restart" doesn't do enough
-	resets_hw->reset |= RESETS_RESET_PIO0_BITS;
-	resets_hw->reset &=~ RESETS_RESET_PIO0_BITS;
-	resets_hw->reset &=~ RESETS_RESET_PIO0_BITS;
-	resets_hw->reset &=~ RESETS_RESET_PIO0_BITS;
-	while (!(resets_hw->reset_done & RESETS_RESET_PIO0_BITS));
-	
-	//stop SMs
-	pio0_hw->ctrl &=~ (7 << PIO_CTRL_SM_ENABLE_LSB);
-	
-	//reset SMs
-	pio0_hw->ctrl = (7 << PIO_CTRL_SM_RESTART_LSB);
-	
-	dipPrvPinsSetup(true);
-	
+	mSmSpi    = (uint)pio_claim_unused_sm(mPio, true);
+	mSmExpand = (uint)pio_claim_unused_sm(mPio, true);
+
+	mOffSpi = (uint)pio_add_program(mPio, &mSpiProg);
+	if (mDepth != 16)
+		mOffExpand = (uint)pio_add_program(mPio, &mExpandProg);
+
+	dispPrvPinsSetup(true);
+	dispPrvPinDirsSetup();
+
 	if (mDepth == 16)
 		dispPrvPioProgram16bpp();
 	else
@@ -378,7 +472,7 @@ static void dispPrvTurnOff(void)
 		dma_hw->ch[i].al1_ctrl = 0;
 	}
 
-	dipPrvPinsSetup(false);
+	dispPrvPinsSetup(false);
 	sio_hw->gpio_set = (1 << mPins.cs);
 	sio_hw->gpio_clr = (1 << mPins.sck) | (1 << mPins.mosi);
 }
@@ -428,9 +522,9 @@ void dispDebugPrintStatus(void)
 	bool dma_ch2_busy = dma_channel_is_busy(2);
 	bool dma_ch3_busy = dma_channel_is_busy(3);
 
-	uint32_t sm_enabled = pio0_hw->ctrl & 0xF;
-	uint32_t flevel = pio0_hw->flevel;
-	uint32_t fstat = pio0_hw->fstat;
+	uint32_t sm_enabled = mPio->ctrl & 0xF;
+	uint32_t flevel = mPio->flevel;
+	uint32_t fstat = mPio->fstat;
 	
 	// Now print the captured snapshot
 	printf("DMA Status:\n");
@@ -517,10 +611,10 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 
         bool sourceStrideMismatch = clipRect.width != stride;
 
-        dipPrvPinsSetup(false);
+        dispPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
 	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
-	dipPrvPinsSetup(true);
+	dispPrvPinsSetup(true);
 
 	if (sourceStrideMismatch) {
 		uint32_t i;
@@ -540,8 +634,8 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
 	}
 
-	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[0];
-	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX0 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[2].write_addr = (uintptr_t)&mPio->txf[mSmExpand];
+	dma_hw->ch[2].al1_ctrl = (pio_get_dreq(mPio, mSmExpand, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
 	dma_hw->ch[3].transfer_count = 1;
@@ -594,10 +688,10 @@ struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const str
 
 	bool sourceStrideMismatch = clipRect.width != stride;
 
-	dipPrvPinsSetup(false);
+	dispPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
 	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
-	dipPrvPinsSetup(true);
+	dispPrvPinsSetup(true);
 
 	if (sourceStrideMismatch) {
 		uint32_t i;
@@ -617,8 +711,8 @@ struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const str
 		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
 	}
 
-	dma_hw->ch[2].write_addr = (uintptr_t)&pio0_hw->txf[1];
-	dma_hw->ch[2].al1_ctrl = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[2].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
+	dma_hw->ch[2].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
 	dma_hw->ch[3].transfer_count = 1;
@@ -689,16 +783,16 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 	mColorValue = color;
 
 	// Setup drawing area for full screen
-	dipPrvPinsSetup(false);
+	dispPrvPinsSetup(false);
 	dispPrvLcdSetDrawArea(clipRect.x, clipRect.y, clipRect.width, clipRect.height);
 	sio_hw->gpio_set = 1 << mPins.dnc;	//data from now on
-	dipPrvPinsSetup(true);
+	dispPrvPinsSetup(true);
 	
 	// Configure DMA channel 3 to send color directly to sm[1]
 	dma_hw->ch[3].read_addr = (uintptr_t)&mColorValue;
-	dma_hw->ch[3].write_addr = (uintptr_t)&pio0_hw->txf[1];
+	dma_hw->ch[3].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
 	dma_hw->ch[3].transfer_count = numPixels;
-	dma_hw->ch[3].ctrl_trig = (DREQ_PIO0_TX1 << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | 
+	dma_hw->ch[3].ctrl_trig = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | 
 	                           (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | 
 	                           (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | 
 	                           DMA_CH0_CTRL_TRIG_EN_BITS;
