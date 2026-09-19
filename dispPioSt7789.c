@@ -47,18 +47,17 @@
 #include "pioAsm.h"
 
 
+#if DISP_COLOR_DEPTH == 8
 static uint16_t __attribute__((aligned(512))) mClut[256];		//MUST be 512 bytes aligned
+#endif
 
-/* Panel bit depth: 8 (indexed through mClut) or 16 (RGB565 straight from the
- * caller's buffer). Ported from Dmitry Grinberg's original driver, which
- * supported 1/2/4/8/16 and which this fork had reduced to 8 alone.
- *
- * The two differ only in how a pixel reaches SM1. SM1 is the SPI shifter and is
+/*
+ * The two depths differ only in how a pixel reaches the SPI shifter, which is
  * the same program in both: autopull at 16, OSR shifting left, one OUT per bit.
- * At 8bpp a byte goes to SM0, which turns it into a CLUT address, and a DMA pair
- * fetches the RGB565 entry into SM1. At 16bpp the framebuffer already holds what
- * SM1 wants, so the data DMA writes it there itself and SM0 and the lookup chain
- * are not used at all.
+ * At 8bpp a byte goes to the expander machine, which turns it into a CLUT
+ * address, and a DMA pair fetches the RGB565 entry into the shifter. At 16bpp
+ * the framebuffer already holds what the shifter wants, so the data DMA writes
+ * it there itself and neither the expander nor the lookup chain exists.
  *
  * A halfword write to a 32-bit FIFO register is replicated across both halves of
  * the bus, so a 16-bit push lands in OSR as 0xCCCCCCCC-style duplicate; shifting
@@ -66,11 +65,8 @@ static uint16_t __attribute__((aligned(512))) mClut[256];		//MUST be 512 bytes a
  * refills after exactly those. That replication is what makes 16bpp need no
  * repacking on the CPU - and dispDrawOneColor() has always relied on it.
  *
- * Fixed at dispInit(). The original driver let an application change depth while
- * running, which cost it a dispSetDepth() that had to tear down and rebuild the
- * DMA wiring safely; nothing here wants that. A client knows at start-up whether
- * it draws indexed or direct colour, and one of the two is dead code for it. */
-static uint8_t mDepth = 8;
+ * DISP_COLOR_DEPTH, in the header, picks which of the two is built.
+ */
 
 /* How this panel is wired, as dispInit() was given it. A copy, so the caller
  * may pass a stack local, and the driver's only source of pin numbers. */
@@ -194,6 +190,7 @@ static const struct pio_program mSpiProg = {
 #endif
 };
 
+#if DISP_COLOR_DEPTH == 8
 /*
  * SM0: turn a byte into a CLUT address. In 8bpp only.
  *
@@ -217,6 +214,8 @@ static const struct pio_program mExpandProg = {
 	.used_gpio_ranges = 0,          /* drives no pins at all */
 #endif
 };
+
+#endif /* DISP_COLOR_DEPTH == 8 */
 
 /*
  * SM1: the SPI shifter, and the one piece both depths share.
@@ -252,6 +251,7 @@ static void dispPrvSpiSmConfigure(void)
 	pio_sm_init(mPio, mSmSpi, mOffSpi, &c);
 }
 
+#if DISP_COLOR_DEPTH == 8
 static void dispPrvExpandSmConfigure(void)
 {
 	pio_sm_config c = pio_get_default_sm_config();
@@ -271,6 +271,9 @@ static void dispPrvExpandSmConfigure(void)
 	pio_sm_exec(mPio, mSmExpand, pio_encode_out(pio_x, 32));
 }
 
+#endif /* DISP_COLOR_DEPTH == 8 */
+
+#if DISP_COLOR_DEPTH == 8
 static void dispPrvPioProgram8bpp(void)
 {
 	/*  For one-shot mode:
@@ -303,6 +306,9 @@ static void dispPrvPioProgram8bpp(void)
 	dma_hw->ch[1].ctrl_trig = (pio_get_dreq(mPio, mSmExpand, false) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
 }
 
+#endif /* DISP_COLOR_DEPTH == 8 */
+
+#if DISP_COLOR_DEPTH == 16
 /*
  * 16bpp: RGB565 straight from the caller's buffer.
  *
@@ -335,6 +341,8 @@ static void dispPrvPioProgram16bpp(void)
 	while (dma_hw->abort);
 	while (dma_channel_is_busy(0) || dma_channel_is_busy(1));
 }
+
+#endif /* DISP_COLOR_DEPTH == 16 */
 
 /*
  * Hand the three SPI pins to PIO, or back to SIO for the start-up bit-bang.
@@ -390,20 +398,22 @@ static void dispPrvPinDirsSetup(void)
  */
 static void dispPrvPioSetup(void)
 {
-	mSmSpi    = (uint)pio_claim_unused_sm(mPio, true);
-	mSmExpand = (uint)pio_claim_unused_sm(mPio, true);
-
+	mSmSpi  = (uint)pio_claim_unused_sm(mPio, true);
 	mOffSpi = (uint)pio_add_program(mPio, &mSpiProg);
-	if (mDepth != 16)
-		mOffExpand = (uint)pio_add_program(mPio, &mExpandProg);
+
+#if DISP_COLOR_DEPTH == 8
+	mSmExpand  = (uint)pio_claim_unused_sm(mPio, true);
+	mOffExpand = (uint)pio_add_program(mPio, &mExpandProg);
+#endif
 
 	dispPrvPinsSetup(true);
 	dispPrvPinDirsSetup();
 
-	if (mDepth == 16)
-		dispPrvPioProgram16bpp();
-	else
-		dispPrvPioProgram8bpp();
+#if DISP_COLOR_DEPTH == 8
+	dispPrvPioProgram8bpp();
+#else
+	dispPrvPioProgram16bpp();
+#endif
 }
 
 static void dispPrvLcdInit(void)
@@ -486,6 +496,7 @@ static void dispPrvTurnOn(void)
 	dispDmaTransferWaitFinish(dispDrawOneColor(0x0000, &mClipArea));
 }
 
+#if DISP_COLOR_DEPTH == 8
 void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries)
 {
 	uint32_t i;
@@ -504,6 +515,8 @@ void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *
 		mClut[effectiveIdx] = (r << 11) + (g << 5) + b;
 	}
 }
+
+#endif /* DISP_COLOR_DEPTH == 8 */
 
 bool dispSetClipArea(const struct Rect *rect)
 {
@@ -592,6 +605,7 @@ bool clipArea(const struct Rect *rect, struct Rect *clipRect)
 	return true;
 }
 
+#if DISP_COLOR_DEPTH == 8
 struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride)
 {
 	if (dmaTransfer.is_working) {
@@ -646,6 +660,10 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 	return &dmaTransfer;
 }
 
+#endif /* DISP_COLOR_DEPTH == 8 */
+
+#if DISP_COLOR_DEPTH == 16
+
 /*
  * Push a rectangle of an RGB565 buffer.
  *
@@ -668,9 +686,6 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride)
 {
 	(void)size;
-
-	if (mDepth != 16)
-		return NULL;
 
 	if (dmaTransfer.is_working) {
 		dispDmaTransferWaitFinish(&dmaTransfer);
@@ -733,6 +748,8 @@ struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const str
  *
  * Clears is_working once the transfer is done, so a later wait returns at once.
  */
+#endif /* DISP_COLOR_DEPTH == 16 */
+
 bool dispDmaTransferBusy(struct dmaTransfer *dmaTransfer)
 {
 	if (!dmaTransfer->is_working)
@@ -829,10 +846,16 @@ bool dispInit(const struct dispPinout *pins, uint8_t bpp)
 	if (pins->sck != pins->cs + 1)
 		return false;
 
-	mPins = *pins;
-	mDepth = bpp;
+	/* The depth is compiled in; the argument only has to agree with it. A
+	 * caller built against the other depth would otherwise call functions this
+	 * driver does not have, or feed the wrong DMA chain. */
+	if (bpp != DISP_COLOR_DEPTH)
+		return false;
 
-	printf("Init: display is %u x %u, %ubpp\n", DISPLAY_WIDTH, DISPLAY_HEIGHT, bpp);
+	mPins = *pins;
+
+	printf("Init: display is %u x %u, %ubpp\n",
+	       DISPLAY_WIDTH, DISPLAY_HEIGHT, DISP_COLOR_DEPTH);
 	dispPrvTurnOn();
 
 	return true;

@@ -56,25 +56,55 @@ struct dispPinout {
 
 struct dmaTransfer;
 
-//`bpp` picks how pixels reach the panel and is fixed for the life of the driver:
-//  8   one byte per pixel, expanded through the CLUT by the PIO - dispDrawBuffer()
-//  16  RGB565 as-is, no lookup and no CPU in the path - dispDrawBuffer16()
-//Either way the panel itself runs in RGB565. False on a bad pinout (see above) or
-//a bpp that is neither 8 nor 16.
-bool dispInit(const struct dispPinout *pins, uint8_t bpp);
+/*
+ * How pixels reach the panel, chosen when this is built:
+ *
+ *   8   one byte per pixel, expanded through the CLUT by the PIO - dispDrawBuffer()
+ *   16  RGB565 as-is, no lookup and no CPU in the path - dispDrawBuffer16()
+ *
+ * Either way the panel itself runs in RGB565; the depth says what the caller's
+ * framebuffer holds, not what the glass wants.
+ *
+ * A build choice rather than a run-time one because an application knows which
+ * it draws long before it runs, and the two paths share almost nothing: a
+ * different PIO program, a different state machine count, a different DMA chain,
+ * and at 8bpp a 512-byte CLUT the other has no use for. Compiling both in would
+ * put the whole of one of them in flash for nothing.
+ *
+ * Set it from the build, e.g.
+ *
+ *     target_compile_definitions(<target> PRIVATE DISP_COLOR_DEPTH=16)
+ *
+ * The prototypes below follow it, so calling the wrong depth's function is a
+ * compile error naming the function rather than a link error naming a symbol.
+ */
+#ifndef DISP_COLOR_DEPTH
+#define DISP_COLOR_DEPTH 8
+#endif
 
-//Only meaningful at 8bpp, but always safe to call: it writes plain memory.
-void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
+#if DISP_COLOR_DEPTH != 8 && DISP_COLOR_DEPTH != 16
+#error "DISP_COLOR_DEPTH must be 8 or 16"
+#endif
+
+//`bpp` must equal DISP_COLOR_DEPTH. It is passed anyway so a caller compiled
+//against a different depth than the driver is caught here, at start-up, with a
+//false - rather than by the panel showing nothing recognisable. False also on a
+//bad pinout; see above.
+bool dispInit(const struct dispPinout *pins, uint8_t bpp);
 
 bool dispSetClipArea(const struct Rect *rect);
 
-//8bpp. `stride` is in bytes. NULL if the rectangle clips away entirely.
+#if DISP_COLOR_DEPTH == 8
+//`stride` is in bytes. NULL if the rectangle clips away entirely.
 struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
 
-//16bpp. RGB565 handed to the panel untouched, no CLUT and no CPU in the path.
-//`stride` is in PIXELS, not bytes. NULL if the rectangle clips away entirely, or
-//if dispInit() was not given 16.
+void dispSetClut(int32_t firstIdx, uint32_t numEntries, const struct ClutEntry *entries);
+#else
+//RGB565 handed to the panel untouched, no CLUT and no CPU in the path.
+//`stride` is in PIXELS, not bytes. NULL if the rectangle clips away entirely.
 struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const struct Rect *rect, uint16_t stride);
+#endif
+
 struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect);
 //Has the transfer finished? Tests the same conditions as the wait below, once,
 //without spinning. Clears the transfer's busy flag when it has.
