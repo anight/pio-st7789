@@ -93,6 +93,36 @@ static uint mSmSpi;         /* the SPI shifter, both depths                  */
 static uint mOffExpand;
 static uint mOffSpi;
 
+/*
+ * The DMA channels, claimed from the SDK for the same reason the state machines
+ * are: a driver that takes channels without claiming them is invisible to the
+ * allocator, and the next driver to ask for one is handed a channel already in
+ * use.
+ *
+ * Two chains, and the numbers have to be known rather than fixed because each
+ * chain's second channel disables its own chaining by pointing CHAIN_TO at
+ * itself, which is how the hardware spells "do not chain".
+ *
+ *   mDmaData -> mDmaWalk    the data chain. mDmaData moves pixels to a state
+ *                           machine; mDmaWalk loads the next row address into
+ *                           mDmaData and re-triggers it, which is what lets a
+ *                           source wider than the rectangle be pushed a row at
+ *                           a time. mDmaWalk also pushes a solid colour on its
+ *                           own, with no chain at all.
+ *
+ *   mDmaClutFetch <-> mDmaClutAddr   the 8bpp lookup ring, and only 8bpp has it.
+ *                           mDmaClutAddr takes a CLUT address from the expander
+ *                           machine and writes it into mDmaClutFetch's trigger;
+ *                           mDmaClutFetch sends that entry to the shifter and
+ *                           chains back to re-arm mDmaClutAddr.
+ */
+static uint mDmaData;
+static uint mDmaWalk;
+#if DISP_COLOR_DEPTH == 8
+static uint mDmaClutFetch;
+static uint mDmaClutAddr;
+#endif
+
 static struct Rect mClipArea = {0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT};
 
 
@@ -296,14 +326,14 @@ static void dispPrvPioProgram8bpp(void)
 	pio_set_sm_mask_enabled(mPio, (1u << mSmExpand) | (1u << mSmSpi), true);
 
 	//ch1 (first) RXes a word from SM0s output and writes to ch0's source reg. then triggers ch0. ch0 then DMAs a single 16 bit CLUT value to SM1's input, triggers ch1 again
-	dma_hw->ch[0].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
-	dma_hw->ch[0].transfer_count = 1;
-	dma_hw->ch[0].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[mDmaClutFetch].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
+	dma_hw->ch[mDmaClutFetch].transfer_count = 1;
+	dma_hw->ch[mDmaClutFetch].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaClutAddr << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS;
 	
-	dma_hw->ch[1].read_addr = (uintptr_t)&mPio->rxf[mSmExpand];
-	dma_hw->ch[1].write_addr = (uintptr_t)&dma_hw->ch[0].al3_read_addr_trig;
-	dma_hw->ch[1].transfer_count = 1;
-	dma_hw->ch[1].ctrl_trig = (pio_get_dreq(mPio, mSmExpand, false) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (1 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
+	dma_hw->ch[mDmaClutAddr].read_addr = (uintptr_t)&mPio->rxf[mSmExpand];
+	dma_hw->ch[mDmaClutAddr].write_addr = (uintptr_t)&dma_hw->ch[mDmaClutFetch].al3_read_addr_trig;
+	dma_hw->ch[mDmaClutAddr].transfer_count = 1;
+	dma_hw->ch[mDmaClutAddr].ctrl_trig = (pio_get_dreq(mPio, mSmExpand, false) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaClutAddr << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_EN_BITS; 
 }
 
 #endif /* DISP_COLOR_DEPTH == 8 */
@@ -332,14 +362,9 @@ static void dispPrvPioProgram16bpp(void)
 	dispPrvSpiSmConfigure();
 	pio_sm_set_enabled(mPio, mSmSpi, true);
 
-	/* ch0/ch1 are the CLUT lookup pair and stay disarmed here. Nothing else
-	 * clears them, so do it explicitly: a channel must not be left armed on a
-	 * DREQ that is about to mean something else. */
-	dma_hw->ch[0].al1_ctrl = 0;
-	dma_hw->ch[1].al1_ctrl = 0;
-	dma_hw->abort = (1 << 0) | (1 << 1);
-	while (dma_hw->abort);
-	while (dma_channel_is_busy(0) || dma_channel_is_busy(1));
+	/* No lookup ring at this depth: the two channels it would use are never
+	 * claimed, so there is nothing here to disarm and nothing of ours to
+	 * clear. */
 }
 
 #endif /* DISP_COLOR_DEPTH == 16 */
@@ -406,6 +431,15 @@ static void dispPrvPioSetup(void)
 	mOffExpand = (uint)pio_add_program(mPio, &mExpandProg);
 #endif
 
+	/* Two channels at 16bpp, four at 8bpp: the lookup ring exists only where
+	 * there is a CLUT to look things up in. */
+	mDmaData = (uint)dma_claim_unused_channel(true);
+	mDmaWalk = (uint)dma_claim_unused_channel(true);
+#if DISP_COLOR_DEPTH == 8
+	mDmaClutFetch = (uint)dma_claim_unused_channel(true);
+	mDmaClutAddr  = (uint)dma_claim_unused_channel(true);
+#endif
+
 	dispPrvPinsSetup(true);
 	dispPrvPinDirsSetup();
 
@@ -468,18 +502,30 @@ static void dispPrvLcdSetDrawArea(uint_fast16_t topLeftCol, uint_fast16_t topLef
 
 static void dispPrvTurnOff(void)
 {
-	uint_fast8_t i, numDmaChannels = 6;
-	
-	dma_hw->inte0 &=~ (1 << 5);
-	for (i = 0; i < numDmaChannels; i++)
-		dma_hw->ch[i].al1_ctrl &=~ DMA_CH0_CTRL_TRIG_EN_BITS;
-		
-	dma_hw->abort = ((1 << numDmaChannels) - 1);		//abort them all
+	/* This driver's channels and no others. Aborting by a fixed range would
+	 * reach whatever else the SDK has handed out - the I2S driver's pair, for
+	 * one - and stop a transfer that has nothing to do with the panel. */
+	const uint mine[] = {
+		mDmaData, mDmaWalk,
+#if DISP_COLOR_DEPTH == 8
+		mDmaClutFetch, mDmaClutAddr,
+#endif
+	};
+	uint32_t mask = 0;
+	uint_fast8_t i;
+
+	for (i = 0; i < count_of(mine); i++)
+		mask |= 1u << mine[i];
+
+	for (i = 0; i < count_of(mine); i++)
+		dma_hw->ch[mine[i]].al1_ctrl &=~ DMA_CH0_CTRL_TRIG_EN_BITS;
+
+	dma_hw->abort = mask;
 	while (dma_hw->abort);
 
-	for (i = 0; i < numDmaChannels; i++) {
-		while (dma_hw->ch[i].al1_ctrl & DMA_CH0_CTRL_TRIG_BUSY_BITS);
-		dma_hw->ch[i].al1_ctrl = 0;
+	for (i = 0; i < count_of(mine); i++) {
+		while (dma_hw->ch[mine[i]].al1_ctrl & DMA_CH0_CTRL_TRIG_BUSY_BITS);
+		dma_hw->ch[mine[i]].al1_ctrl = 0;
 	}
 
 	dispPrvPinsSetup(false);
@@ -530,10 +576,12 @@ bool dispSetClipArea(const struct Rect *rect)
 void dispDebugPrintStatus(void)
 {
 	// Capture snapshot of all status values first (before slow printf)
-	bool dma_ch0_busy = dma_channel_is_busy(0);
-	bool dma_ch1_busy = dma_channel_is_busy(1);
-	bool dma_ch2_busy = dma_channel_is_busy(2);
-	bool dma_ch3_busy = dma_channel_is_busy(3);
+	bool data_busy = dma_channel_is_busy(mDmaData);
+	bool walk_busy = dma_channel_is_busy(mDmaWalk);
+#if DISP_COLOR_DEPTH == 8
+	bool clut_fetch_busy = dma_channel_is_busy(mDmaClutFetch);
+	bool clut_addr_busy  = dma_channel_is_busy(mDmaClutAddr);
+#endif
 
 	uint32_t sm_enabled = mPio->ctrl & 0xF;
 	uint32_t flevel = mPio->flevel;
@@ -541,10 +589,12 @@ void dispDebugPrintStatus(void)
 	
 	// Now print the captured snapshot
 	printf("DMA Status:\n");
-	printf("  CH0: %s", dma_ch0_busy ? "BUSY" : "idle");
-	printf("  CH1: %s", dma_ch1_busy ? "BUSY" : "idle");
-	printf("  CH2: %s", dma_ch2_busy ? "BUSY" : "idle");
-	printf("  CH3: %s\n", dma_ch3_busy ? "BUSY" : "idle");
+	printf("  data (ch%u): %s", mDmaData, data_busy ? "BUSY" : "idle");
+	printf("  walk (ch%u): %s\n", mDmaWalk, walk_busy ? "BUSY" : "idle");
+#if DISP_COLOR_DEPTH == 8
+	printf("  clut fetch (ch%u): %s", mDmaClutFetch, clut_fetch_busy ? "BUSY" : "idle");
+	printf("  clut addr (ch%u): %s\n", mDmaClutAddr, clut_addr_busy ? "BUSY" : "idle");
+#endif
 	
 	printf("PIO State Machines:\n");
 	printf("  SM0: %s", (sm_enabled & (1 << 0)) ? "ENABLED" : "disabled");
@@ -561,8 +611,8 @@ void dispDebugPrintStatus(void)
 
 struct dmaTransfer {
 	bool is_working;
-	uintptr_t ch3_end_read_addr;
-	uintptr_t ch2_end_read_addr;
+	uintptr_t walk_end_read_addr;
+	uintptr_t data_end_read_addr;
 };
 
 static struct dmaTransfer dmaTransfer = {0};
@@ -637,24 +687,24 @@ struct dmaTransfer *dispDrawBuffer(void* framebuffer, uint32_t size, const struc
 			bufs[i] = addr;
 		}
 		bufs[i] = 0;
-		dma_hw->ch[2].transfer_count = clipRect.width;
-		dmaTransfer.ch2_end_read_addr = 0;
-		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[clipRect.height+1];
+		dma_hw->ch[mDmaData].transfer_count = clipRect.width;
+		dmaTransfer.data_end_read_addr = 0;
+		dmaTransfer.walk_end_read_addr = (uintptr_t)&bufs[clipRect.height+1];
 	} else {
 		bufs[0] = (uintptr_t)adjustedFb;
 		bufs[1] = 0;
-		dma_hw->ch[2].transfer_count = newSize;
-		dmaTransfer.ch2_end_read_addr = 0;
-		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
+		dma_hw->ch[mDmaData].transfer_count = newSize;
+		dmaTransfer.data_end_read_addr = 0;
+		dmaTransfer.walk_end_read_addr = (uintptr_t)&bufs[2];
 	}
 
-	dma_hw->ch[2].write_addr = (uintptr_t)&mPio->txf[mSmExpand];
-	dma_hw->ch[2].al1_ctrl = (pio_get_dreq(mPio, mSmExpand, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[mDmaData].write_addr = (uintptr_t)&mPio->txf[mSmExpand];
+	dma_hw->ch[mDmaData].al1_ctrl = (pio_get_dreq(mPio, mSmExpand, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaWalk << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_BYTE << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
-	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
-	dma_hw->ch[3].transfer_count = 1;
-	dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
-	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[mDmaWalk].read_addr = (uintptr_t)bufs;
+	dma_hw->ch[mDmaWalk].transfer_count = 1;
+	dma_hw->ch[mDmaWalk].write_addr = (uintptr_t)&dma_hw->ch[mDmaData].al3_read_addr_trig;
+	dma_hw->ch[mDmaWalk].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaWalk << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	dmaTransfer.is_working = true;
 	return &dmaTransfer;
@@ -715,24 +765,24 @@ struct dmaTransfer *dispDrawBuffer16(void* framebuffer, uint32_t size, const str
 			bufs[i] = addr;
 		}
 		bufs[i] = 0;
-		dma_hw->ch[2].transfer_count = clipRect.width;
-		dmaTransfer.ch2_end_read_addr = 0;
-		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[clipRect.height+1];
+		dma_hw->ch[mDmaData].transfer_count = clipRect.width;
+		dmaTransfer.data_end_read_addr = 0;
+		dmaTransfer.walk_end_read_addr = (uintptr_t)&bufs[clipRect.height+1];
 	} else {
 		bufs[0] = (uintptr_t)adjustedFb;
 		bufs[1] = 0;
-		dma_hw->ch[2].transfer_count = newSize;
-		dmaTransfer.ch2_end_read_addr = 0;
-		dmaTransfer.ch3_end_read_addr = (uintptr_t)&bufs[2];
+		dma_hw->ch[mDmaData].transfer_count = newSize;
+		dmaTransfer.data_end_read_addr = 0;
+		dmaTransfer.walk_end_read_addr = (uintptr_t)&bufs[2];
 	}
 
-	dma_hw->ch[2].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
-	dma_hw->ch[2].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[mDmaData].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
+	dma_hw->ch[mDmaData].al1_ctrl = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaWalk << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
-	dma_hw->ch[3].read_addr = (uintptr_t)bufs;
-	dma_hw->ch[3].transfer_count = 1;
-	dma_hw->ch[3].write_addr = (uintptr_t)&dma_hw->ch[2].al3_read_addr_trig;
-	dma_hw->ch[3].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
+	dma_hw->ch[mDmaWalk].read_addr = (uintptr_t)bufs;
+	dma_hw->ch[mDmaWalk].transfer_count = 1;
+	dma_hw->ch[mDmaWalk].write_addr = (uintptr_t)&dma_hw->ch[mDmaData].al3_read_addr_trig;
+	dma_hw->ch[mDmaWalk].ctrl_trig = (DREQ_FORCE << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | (mDmaWalk << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_WORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | DMA_CH0_CTRL_TRIG_INCR_READ_BITS | DMA_CH0_CTRL_TRIG_EN_BITS;
 
 	dmaTransfer.is_working = true;
 	return &dmaTransfer;
@@ -755,15 +805,15 @@ bool dispDmaTransferBusy(struct dmaTransfer *dmaTransfer)
 	if (!dmaTransfer->is_working)
 		return false;
 
-	if (dma_hw->ch[3].read_addr != dmaTransfer->ch3_end_read_addr)
+	if (dma_hw->ch[mDmaWalk].read_addr != dmaTransfer->walk_end_read_addr)
 		return true;
-	if (dma_channel_is_busy(3))
+	if (dma_channel_is_busy(mDmaWalk))
 		return true;
 
-	if (dmaTransfer->ch2_end_read_addr != (uintptr_t)-1) {
-		if (dma_hw->ch[2].read_addr != dmaTransfer->ch2_end_read_addr)
+	if (dmaTransfer->data_end_read_addr != (uintptr_t)-1) {
+		if (dma_hw->ch[mDmaData].read_addr != dmaTransfer->data_end_read_addr)
 			return true;
-		if (dma_channel_is_busy(2))
+		if (dma_channel_is_busy(mDmaData))
 			return true;
 	}
 
@@ -773,11 +823,11 @@ bool dispDmaTransferBusy(struct dmaTransfer *dmaTransfer)
 
 void dispDmaTransferWaitFinish(struct dmaTransfer *dmaTransfer)
 {
-	while (dma_hw->ch[3].read_addr != dmaTransfer->ch3_end_read_addr);
-	while (dma_channel_is_busy(3));
-	if (dmaTransfer->ch2_end_read_addr != (uintptr_t)-1) {
-	        while (dma_hw->ch[2].read_addr != dmaTransfer->ch2_end_read_addr);
-	        while (dma_channel_is_busy(2));
+	while (dma_hw->ch[mDmaWalk].read_addr != dmaTransfer->walk_end_read_addr);
+	while (dma_channel_is_busy(mDmaWalk));
+	if (dmaTransfer->data_end_read_addr != (uintptr_t)-1) {
+	        while (dma_hw->ch[mDmaData].read_addr != dmaTransfer->data_end_read_addr);
+	        while (dma_channel_is_busy(mDmaData));
 	}
 	dmaTransfer->is_working = false;
 }
@@ -806,16 +856,16 @@ struct dmaTransfer *dispDrawOneColor(uint16_t color, const struct Rect *rect)
 	dispPrvPinsSetup(true);
 	
 	// Configure DMA channel 3 to send color directly to sm[1]
-	dma_hw->ch[3].read_addr = (uintptr_t)&mColorValue;
-	dma_hw->ch[3].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
-	dma_hw->ch[3].transfer_count = numPixels;
-	dma_hw->ch[3].ctrl_trig = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | 
-	                           (3 << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | 
+	dma_hw->ch[mDmaWalk].read_addr = (uintptr_t)&mColorValue;
+	dma_hw->ch[mDmaWalk].write_addr = (uintptr_t)&mPio->txf[mSmSpi];
+	dma_hw->ch[mDmaWalk].transfer_count = numPixels;
+	dma_hw->ch[mDmaWalk].ctrl_trig = (pio_get_dreq(mPio, mSmSpi, true) << DMA_CH0_CTRL_TRIG_TREQ_SEL_LSB) | 
+	                           (mDmaWalk << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB) | 
 	                           (DMA_CH0_CTRL_TRIG_DATA_SIZE_VALUE_SIZE_HALFWORD << DMA_CH0_CTRL_TRIG_DATA_SIZE_LSB) | 
 	                           DMA_CH0_CTRL_TRIG_EN_BITS;
 
-	dmaTransfer.ch3_end_read_addr = (uintptr_t)&mColorValue;
-	dmaTransfer.ch2_end_read_addr = (uintptr_t)-1;
+	dmaTransfer.walk_end_read_addr = (uintptr_t)&mColorValue;
+	dmaTransfer.data_end_read_addr = (uintptr_t)-1;
 	dmaTransfer.is_working = true;
 
 	return &dmaTransfer;
